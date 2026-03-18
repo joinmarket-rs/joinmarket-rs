@@ -1,0 +1,8 @@
+# joinmarket-rs — Rust reimplementation of the JoinMarket suite
+[workspace]
+members = [
+    "crates/joinmarket-core",
+    "crates/joinmarket-tor",
+    "crates/joinmarket-dn",
+]
+resolver = "2"

@@ -1,0 +1,108 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            use_cross: true
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-latest
+            use_cross: true
+          - target: armv7-unknown-linux-musleabihf
+            runner: ubuntu-latest
+            use_cross: true
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            use_cross: false
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            use_cross: false
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            use_cross: false
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --rev 588b3c99db52b5a9c5906fab96cfadcf1bde7863
+
+      - name: Build (cross)
+        if: matrix.use_cross
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Build (native)
+        if: "!matrix.use_cross"
+        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          RUSTFLAGS: ${{ matrix.target == 'x86_64-pc-windows-msvc' && '-C target-feature=+crt-static' || '' }}
+
+      - name: Determine binary name
+        id: bin
+        shell: bash
+        run: |
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            echo "src=target/${{ matrix.target }}/release/joinmarket-dn.exe" >> "$GITHUB_OUTPUT"
+            echo "name=joinmarket-dn-${{ matrix.target }}.exe" >> "$GITHUB_OUTPUT"
+          else
+            echo "src=target/${{ matrix.target }}/release/joinmarket-dn" >> "$GITHUB_OUTPUT"
+            echo "name=joinmarket-dn-${{ matrix.target }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.bin.outputs.name }}
+          path: ${{ steps.bin.outputs.src }}
+          if-no-files-found: error
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir release
+          for dir in artifacts/*/; do
+            name=$(basename "$dir")
+            cp "$dir"/* "release/$name"
+          done
+
+      - name: Generate checksums
+        working-directory: release
+        run: sha256sum * > SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release/*

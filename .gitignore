@@ -1,0 +1,41 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Build artifacts
+*.rlib
+*.rmeta
+*.d
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Claude Code
+CLAUDE.md
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Tor / keys (never commit private key material)
+hs_ed25519_secret_key
+hs_ed25519_public_key
+hostname
+
+# Logs and data
+*.log
+joinmarket-dn.db
+
+# Docs build output
+docs/_build/

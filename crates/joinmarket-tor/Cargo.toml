@@ -1,0 +1,50 @@
+[package]
+name = "joinmarket-tor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+joinmarket-core = { path = "../joinmarket-core" }
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+
+[dependencies.arti-client]
+version = "0.40"
+default-features = false
+features = ["onion-service-service", "hs-pow-full", "tokio", "rustls", "compression"]
+optional = true
+
+[dependencies.tor-hsservice]
+version = "0.40"
+optional = true
+
+[dependencies.tor-rtcompat]
+version = "0.40"
+default-features = false
+features = ["tokio", "rustls"]
+optional = true
+
+[dependencies.tor-cell]
+version = "0.40"
+optional = true
+
+[dependencies.safelog]
+version = "0.8"
+optional = true
+
+[features]
+default = ["tordaemon"]
+tordaemon = []   # C Tor daemon backend (CTorProvider); requires tor binary on host
+arti = [         # Arti embedded Tor backend; pulls in LGPL equix/hashx for PoW
+    "dep:arti-client",
+    "dep:tor-hsservice",
+    "dep:tor-rtcompat",
+    "dep:tor-cell",
+    "dep:safelog",
+]
+# NOTE: arti and tordaemon are mutually exclusive.
+# To build with Arti: cargo build --no-default-features --features arti

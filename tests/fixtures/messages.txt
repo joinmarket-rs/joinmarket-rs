@@ -1,0 +1,8 @@
+# JoinMarket wire message fixtures
+# Format: one message per line (newline-terminated as on the wire)
+!getpeers
+!ping
+!pong
+!ann absorder J5testMakerOOOOO sw0 minsize=27300 maxsize=7142857 ordertype=sw0 cjfee_a=2100 cjfee_r=0.0002 txfee=0 mixdepth=0 available_balance=100000000
+!fill J5testMakerOOOOO 1000000 abc123
+!disconnect

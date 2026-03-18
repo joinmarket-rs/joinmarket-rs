@@ -1,0 +1,41 @@
+[package]
+name = "joinmarket-dn"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "joinmarket-dn"
+path = "src/main.rs"
+
+[lib]
+name = "joinmarket_dn"
+path = "src/lib.rs"
+
+[dependencies]
+joinmarket-core = { path = "../joinmarket-core" }
+joinmarket-tor = { path = "../joinmarket-tor", default-features = false }
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dashmap = "5"
+parking_lot = "0.12"
+rand = "0.8"
+slab = "0.4"
+tokio-util = { version = "0.7", features = ["codec"] }
+anyhow = "1"
+thiserror = "1"
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+base64 = "0.21"
+metrics = "0.22"
+metrics-exporter-prometheus = { version = "0.13", default-features = false, features = ["http-listener"] }
+
+[features]
+default = ["tordaemon"]
+tordaemon = ["joinmarket-tor/tordaemon"]
+arti = ["joinmarket-tor/arti"]
+
+[dev-dependencies]
+tokio-test = "0.4"
+serial_test = "3"

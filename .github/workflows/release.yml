@@ -13,11 +13,19 @@ env:
 
 jobs:
   build:
-    name: Build ${{ matrix.target }}
+    name: Build ${{ matrix.target }} (${{ matrix.variant }})
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
+        variant: [default, arti]
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - armv7-unknown-linux-musleabihf
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+          - x86_64-pc-windows-msvc
         include:
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
@@ -52,11 +60,11 @@ jobs:
 
       - name: Build (cross)
         if: matrix.use_cross
-        run: cross build --release --target ${{ matrix.target }}
+        run: cross build --release --target ${{ matrix.target }} ${{ matrix.variant == 'arti' && '--no-default-features --features arti' || '' }}
 
       - name: Build (native)
         if: "!matrix.use_cross"
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} ${{ matrix.variant == 'arti' && '--no-default-features --features arti' || '' }}
         env:
           RUSTFLAGS: ${{ matrix.target == 'x86_64-pc-windows-msvc' && '-C target-feature=+crt-static' || '' }}
 
@@ -64,12 +72,13 @@ jobs:
         id: bin
         shell: bash
         run: |
+          SUFFIX="${{ matrix.variant == 'arti' && '-arti' || '' }}"
           if [[ "${{ matrix.target }}" == *windows* ]]; then
             echo "src=target/${{ matrix.target }}/release/joinmarket-dn.exe" >> "$GITHUB_OUTPUT"
-            echo "name=joinmarket-dn-${{ matrix.target }}.exe" >> "$GITHUB_OUTPUT"
+            echo "name=joinmarket-dn${SUFFIX}-${{ matrix.target }}.exe" >> "$GITHUB_OUTPUT"
           else
             echo "src=target/${{ matrix.target }}/release/joinmarket-dn" >> "$GITHUB_OUTPUT"
-            echo "name=joinmarket-dn-${{ matrix.target }}" >> "$GITHUB_OUTPUT"
+            echo "name=joinmarket-dn${SUFFIX}-${{ matrix.target }}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Upload artifact

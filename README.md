@@ -100,7 +100,7 @@ Features are defined on the `joinmarket-tor` crate and are passed through to the
 
 | Feature | Crate | What it enables | Default |
 |---------|-------|-----------------|---------|
-| `tordaemon` | `joinmarket-tor` | C Tor daemon backend (`CTorProvider`). Requires the `tor` binary on the host. PoW defence compiled in; activated at runtime with `--pow` (requires `--enable-gpl` C Tor build). | **On** |
+| `tordaemon` | `joinmarket-tor` | C Tor daemon backend (`CTorProvider`). Requires the `tor` binary on the host. PoW defence is configured externally via C Tor (requires a `tor` build with `--enable-gpl`); the directory node has no visibility into whether PoW is active. | **On** |
 | `arti` | `joinmarket-tor` | Arti embedded Tor backend (`ArtiTorProvider`). No external `tor` binary needed. Pulls in LGPL `equix`/`hashx` crates for PoW; activated at runtime with `--pow`. | Off |
 
 **Default build (C Tor daemon backend):**
@@ -109,7 +109,7 @@ Features are defined on the `joinmarket-tor` crate and are passed through to the
 cargo build --release
 ```
 
-The `tordaemon` feature is on by default. Point `--hidden-service-dir` at your existing C Tor hidden service directory and run the binary.
+The `tordaemon` feature is on by default. Configure your existing C Tor hidden service directory in `joinmarket.cfg` and run the binary.
 
 **Build with the Arti embedded backend:**
 
@@ -122,22 +122,15 @@ cargo build --release \
 Then activate PoW at runtime with `--pow`:
 
 ```bash
-joinmarket-dn --pow "My PoW-protected directory"
-```
-
-**Build with both backends:**
-
-```bash
-cargo build --release \
-  --features joinmarket-dn/arti
+joinmarket-dn --pow "My PoW-protected directory node"
 ```
 
 > **PoW licensing note:** The `arti` feature pulls in the `equix` and `hashx` crates,
 > which are LGPL-licensed. Binaries linked against them are LGPL-encumbered.
 >
 > The `tordaemon` feature supports PoW via C Tor's built-in defence, which requires a
-> `tor` binary compiled with `--enable-gpl`. Without it, `--pow` logs a prominent warning
-> and the node starts without Tor-level DoS protection.
+> `tor` binary compiled with `--enable-gpl`. Without it, the node starts without
+> Tor-level DoS protection.
 
 ## Testing
 
@@ -215,13 +208,13 @@ The directory node implements five layers of defence against abuse:
 
 | Layer | Mechanism | Default |
 |-------|-----------|---------|
-| 1 | Tor PoW (Equi-X puzzles) | Off — pass `--pow` to enable |
+| 1 | Tor PoW (Equi-X puzzles) | Off — `--pow` enables it with the `arti` backend; with `tordaemon`, PoW is configured externally via C Tor |
 | 2 | Connection rate limit: 3 connections/minute per onion | Always on |
 | 3 | Sybil guard: one active nick per onion address | Always on |
 | 4 | Fidelity bond UTXO deduplication | Always on |
 | 5 | Maker registration throttle: 60 new makers/minute, 100k cap | Always on |
 
-**PoW note:** `--pow` activates PoW at runtime. The `tordaemon` backend (default) requires a `tor` binary compiled with `--enable-gpl`; the `arti` backend requires the binary to be built with `--features arti`. Passing `--pow` without the required support causes the process to abort at startup rather than silently running unprotected.
+**PoW note:** `--pow` is only available with the `arti` backend and activates Equi-X PoW puzzles at runtime. With the `tordaemon` backend, PoW is configured externally through C Tor itself (requires a `tor` binary compiled with `--enable-gpl`); the directory node has no way to detect whether C Tor has PoW enabled.
 
 ## Peer routing
 
@@ -255,7 +248,7 @@ Wants=network-online.target
 
 [Service]
 ExecStart=/usr/local/bin/joinmarket-dn \
-    --hidden-service-dir=/var/lib/joinmarket/hs-keys \
+    --datadir /var/lib/joinmarket \
     "Greetings from a Rust directory node"
 User=joinmarket
 Restart=on-failure

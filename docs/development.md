@@ -49,7 +49,7 @@
 
 - [ ] `heartbeat.rs` ping/pong liveness eviction
 - [ ] `metrics.rs` all Prometheus metrics wired
-- [ ] Prometheus HTTP endpoint on `--metrics-port`
+- [ ] Prometheus HTTP endpoint on `--metrics-bind`
 - [ ] Structured tracing spans (nick + connection_id per peer)
 - [ ] `systemd` unit file
 - [ ] Docker image (scratch + binary)

@@ -679,12 +679,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "configparser"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe1d7dcda7d1da79e444bdfba1465f2f849a58b07774e1df473ee77030cb47a7"
-
-[[package]]
 name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2054,15 +2048,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ini"
-version = "1.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a9271a5dfd4228fa56a78d7508a35c321639cc71f783bb7a5723552add87bce"
-dependencies = [
- "configparser",
-]
-
-[[package]]
 name = "inotify"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2155,7 +2140,6 @@ dependencies = [
  "bs58",
  "data-encoding",
  "hex",
- "ini",
  "rand 0.8.5",
  "secp256k1",
  "serde",
@@ -2182,10 +2166,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "parking_lot",
  "rand 0.8.5",
- "serde",
- "serde_json",
  "serial_test",
- "slab",
  "thiserror 1.0.69",
  "tokio",
  "tokio-test",
@@ -2202,7 +2183,6 @@ dependencies = [
  "arti-client",
  "async-trait",
  "futures",
- "joinmarket-core",
  "safelog",
  "thiserror 1.0.69",
  "tokio",

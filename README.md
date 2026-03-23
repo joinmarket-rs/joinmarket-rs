@@ -153,74 +153,52 @@ cargo test -p joinmarket-dn
 cargo test -p joinmarket-core onion::tests::test_valid_v3_address
 ```
 
-There are currently **47 tests** across the workspace:
+There are currently **106 tests** across the workspace:
 
 | Crate | Tests |
 |-------|-------|
-| `joinmarket-core` | 35 (nick, onion, message, handshake, crypto, fidelity bond, config) |
-| `joinmarket-dn` | 12 (router, sybil guard, bond registry, admission control) |
+| `joinmarket-core` | 68 (nick, onion, message, handshake, crypto, fidelity bond, config) |
+| `joinmarket-dn` | 22 unit + 16 integration (router, sybil guard, bond registry, admission control, end-to-end) |
 
 ## Running
 
 ```
-joinmarket-dn [OPTIONS] [MOTD]
+joinmarket-dn [OPTIONS] [OPERATOR_MESSAGE]
 
 Options:
-  --network <NET>             mainnet | testnet | signet [default: mainnet]
-  --port <PORT>               Listening port [default: 5222]
-  --metrics-port <PORT>       Prometheus metrics port [default: 9090]
-  --pow                       Enable Tor PoW DoS defence (see note below)
-  --state-dir <PATH>          Arti state directory — required for key persistence.
-                              Arti stores the hidden service Ed25519 key here;
-                              without it the .onion address changes on every restart.
-                              Selects the Arti backend when both backends are compiled.
+  --datadir <PATH>            Data directory [default: ~/.joinmarket].
+                              Must contain joinmarket.cfg with [MESSAGING:onion]
+                              and [BLOCKCHAIN] sections.
+  --metrics-bind <ADDR>       Prometheus metrics bind address [default: 127.0.0.1:9090]
+  --pow                       Enable Tor PoW DoS defence (requires a binary built
+                              with --features arti)
                               [only available when built with the `arti` feature]
-  --hidden-service-dir <PATH> C Tor hidden service directory — required for key
-                              persistence. C Tor stores the hidden service Ed25519 key
-                              here; without it the .onion address changes on every
-                              restart. Selects the C Tor backend when both backends
-                              are compiled. [only available with the `tordaemon` feature]
 
-When both `arti` and `tordaemon` features are compiled in, exactly one of
---state-dir or --hidden-service-dir must be provided; they are mutually exclusive
-and the one supplied determines which backend is used.
+Network, port, hidden service directory, and other settings are read from
+joinmarket.cfg (located in the data directory). If no config file exists,
+a default one is created and the process exits for you to review it.
 
 Arguments:
-  [MOTD]                      Message of the day sent to connecting peers
+  [OPERATOR_MESSAGE]          Optional operator message appended to the MOTD
 ```
 
 ### Basic example
 
 ```bash
-joinmarket-dn --network mainnet "Welcome to my directory node"
+joinmarket-dn "Welcome to my directory node"
 ```
 
-### Testnet example
+### Custom data directory
 
 ```bash
-joinmarket-dn --network testnet --port 5222 "Testnet directory node"
+joinmarket-dn --datadir /var/lib/joinmarket "My directory node"
 ```
 
-### C Tor backend (default build)
+### With PoW (Arti build only)
 
 ```bash
-joinmarket-dn \
-  --hidden-service-dir /var/lib/joinmarket/hs-keys \
-  --network mainnet \
-  "My directory node"
+joinmarket-dn --pow "My PoW-protected directory"
 ```
-
-### Arti backend
-
-```bash
-joinmarket-dn \
-  --state-dir /var/lib/joinmarket/arti-state \
-  --network mainnet \
-  "My directory node"
-```
-
-> Each backend option is only present at runtime when that feature was compiled in.
-> When both features are compiled in, supply exactly one to select the backend.
 
 ### Log level
 
@@ -263,7 +241,7 @@ Designed for **100k concurrent peers** on a single server:
 |----------|----------|------------|
 | Tokio task stack | ~6 KB | ~600 MB |
 | Read/write buffers (4 KB each) | 8 KB | ~800 MB |
-| PeerState in slab | ~128 B | ~13 MB |
+| PeerMeta in DashMap | ~128 B | ~13 MB |
 | Nick index entry | ~200 B | ~20 MB |
 | **Total** | **~14 KB** | **~1.4 GB** |
 

@@ -22,7 +22,7 @@ Directory node adds `"directory": true` and `"motd": "<message>"` to its outboun
 !command field1 field2 ... fieldN\n
 ```
 
-Messages are newline-terminated (`\n`), whitespace-delimited. Maximum line length: 8192 bytes.
+Messages are newline-terminated (`\n`), whitespace-delimited. Maximum line length: 40,000 bytes (matches Python JoinMarket's `MAX_LENGTH`).
 
 ## `!getpeers` / `!peers` exchange
 

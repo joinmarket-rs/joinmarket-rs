@@ -439,38 +439,25 @@ The binary. Depends on `joinmarket-core` and `joinmarket-tor`.
 CLI via `clap`:
 
 ```
-joinmarket-dn [OPTIONS] [MOTD]
+joinmarket-dn [OPTIONS] [OPERATOR_MESSAGE]
 
 Options:
-  --datadir <PATH>     Data directory [default: the standard JoinMarket config directory:
-                         Linux/macOS: ~/.joinmarket
-                         Resolved at runtime via $HOME; process aborts if $HOME is unset
-                         and --datadir is not provided]
-  --config <PATH>      Config file [default: <datadir>/joinmarket.cfg]
-  --network <NET>      mainnet | testnet | signet [default: mainnet]
-  --port <PORT>        Listening port [default: 5222]
-  --metrics-bind <ADDR> Prometheus metrics bind address [default: 127.0.0.1:9090]
-  --pow                Enable Tor PoW DoS defence (off by default; only available
-                         when built with --features arti; requires the hs-pow-full
-                         feature which is included automatically)
-                       [only present when built with the `arti` feature]
-  --state-dir <PATH>   Arti state directory — required for key persistence.
-                         Arti stores the hidden service Ed25519 key here; without it
-                         the .onion address changes on every restart.
-                         Selects the Arti backend when both backends are compiled.
+  --datadir <PATH>      Data directory [default: ~/.joinmarket].
+                          Must contain joinmarket.cfg with [MESSAGING:onion]
+                          and [BLOCKCHAIN] sections. Resolved at runtime via
+                          $HOME; process aborts if $HOME is unset and --datadir
+                          is not provided.
+  --metrics-bind <ADDR>  Prometheus metrics bind address [default: 127.0.0.1:9090]
+  --pow                  Enable Tor PoW DoS defence (requires a binary built
+                           with --features arti)
                          [only present when built with the `arti` feature]
-  --hidden-service-dir Path to the C Tor hidden service directory — required for key
-                         persistence. C Tor stores the hidden service Ed25519 key here;
-                         without it the .onion address changes on every restart.
-                         Selects the C Tor backend when both backends are compiled.
-                         [only present when built with the `tordaemon` feature]
 
-When both `arti` and `tordaemon` features are compiled in, exactly one of
---state-dir or --hidden-service-dir must be provided; they are mutually exclusive
-and the one supplied determines which Tor backend is used.
+Network, port, hidden service directory, and other settings are read from
+joinmarket.cfg (located in the data directory). If no config file exists,
+a default one is created and the process exits for the operator to review it.
 
 Arguments:
-  [MOTD]               Message of the day sent to connecting peers
+  [OPERATOR_MESSAGE]    Optional operator message appended to the MOTD
 ```
 
 Startup sequence:
@@ -757,8 +744,8 @@ Bond weight formula (for sampling at scale): `bond_value = (locked_coins × (exp
 
 ```toml
 [dependencies]
-secp256k1 = { version = "0.28", features = ["global-context"] }
-x25519-dalek = "2"
+secp256k1 = { version = "0.28", features = ["global-context", "rand-std", "recovery"] }
+x25519-dalek = { version = "2", features = ["static_secrets", "getrandom"] }
 xsalsa20poly1305 = "0.9"
 bitcoin_hashes = "0.13"
 bs58 = "0.5"
@@ -766,8 +753,9 @@ data-encoding = "2"          # BASE32_NOPAD for onion address decoding
 sha3 = "0.10"                # Sha3_256 for onion address checksum verification
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-ini = "1"
 thiserror = "1"
+rand = "0.8"
+base64 = "0.21"
 ```
 
 ### `joinmarket-tor/Cargo.toml`
@@ -779,28 +767,42 @@ futures = "0.3"
 async-trait = "0.1"
 anyhow = "1"
 thiserror = "1"
+tracing = "0.1"
 
 [dependencies.arti-client]
-version = "0.23"
-features = ["onion-service-service"]
+version = "0.40"
+default-features = false
+features = ["onion-service-service", "hs-pow-full", "tokio", "rustls", "compression"]
 optional = true
 
 [dependencies.tor-hsservice]
-version = "0.23"
+version = "0.40"
 optional = true
 
 [dependencies.tor-rtcompat]
-version = "0.23"
+version = "0.40"
+default-features = false
+features = ["tokio", "rustls"]
 optional = true
 
-[dependencies.tor-keymgr]
-version = "0.23"
+[dependencies.tor-cell]
+version = "0.40"
+optional = true
+
+[dependencies.safelog]
+version = "0.8"
 optional = true
 
 [features]
 default = ["tordaemon"]
-tordaemon = []               # CTorProvider (default); requires tor binary on host
-arti = ["arti-client", "tor-hsservice", "tor-rtcompat", "tor-keymgr", "equix", "hashx"]
+tordaemon = []   # C Tor daemon backend (CTorProvider); requires tor binary on host
+arti = [         # Arti embedded Tor backend; pulls in LGPL equix/hashx for PoW
+    "dep:arti-client",
+    "dep:tor-hsservice",
+    "dep:tor-rtcompat",
+    "dep:tor-cell",
+    "dep:safelog",
+]
 ```
 
 ### `joinmarket-dn/Cargo.toml`
@@ -808,19 +810,20 @@ arti = ["arti-client", "tor-hsservice", "tor-rtcompat", "tor-keymgr", "equix", "
 ```toml
 [dependencies]
 joinmarket-core = { path = "../joinmarket-core" }
-joinmarket-tor  = { path = "../joinmarket-tor" }
+joinmarket-tor = { path = "../joinmarket-tor", default-features = false }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dashmap = "5"
-slab = "0.4"
-metrics = "0.22"
-metrics-exporter-prometheus = "0.13"
+parking_lot = "0.12"
+rand = "0.8"
 tokio-util = { version = "0.7", features = ["codec"] }
 anyhow = "1"
 thiserror = "1"
-tokio-util = "0.7"
+base64 = "0.21"
+metrics = "0.22"
+metrics-exporter-prometheus = { version = "0.13", default-features = false, features = ["http-listener"] }
 ```
 
 ---
@@ -832,7 +835,7 @@ tokio-util = "0.7"
 | Tokio task stack    | ~6 KB     | ~600 MB    |
 | Read buffer (4 KB)  | 4 KB      | ~400 MB    |
 | Write buffer (4 KB) | 4 KB      | ~400 MB    |
-| PeerState in slab   | ~128 B    | ~13 MB     |
+| PeerMeta in DashMap  | ~128 B    | ~13 MB     |
 | Nick index entry    | ~200 B    | ~20 MB     |
 | Broadcast handle    | ~80 B     | ~8 MB      |
 | **Total**           | **~14 KB**| **~1.4 GB**|
@@ -841,4 +844,4 @@ Use 4 KB `BufReader`/`BufWriter` (not the default 8 KB). JoinMarket messages are
 
 Use `Arc<str>` not `String` for nicks and onion addresses stored in the registry (immutable shared strings, one allocation per unique value).
 
-Use `slab::Slab<PeerState>` for contiguous peer state allocation.
+Use `ShardedRegistry<T>` (64 `parking_lot::Mutex<HashMap<Arc<str>, T>>` shards) for maker/taker registries, and `DashMap<Arc<str>, PeerMeta>` for peer metadata.

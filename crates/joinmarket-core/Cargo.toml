@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 secp256k1 = { version = "0.28", features = ["global-context", "rand-std", "recovery"] }
 x25519-dalek = { version = "2", features = ["static_secrets", "getrandom"] }
-xsalsa20poly1305 = "0.9"
+crypto_secretbox = "0.1"
 bitcoin_hashes = "0.13"
 bs58 = "0.5"
 data-encoding = "2"

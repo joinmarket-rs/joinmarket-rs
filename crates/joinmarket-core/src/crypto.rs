@@ -1,6 +1,6 @@
 use x25519_dalek::{StaticSecret, PublicKey as X25519PublicKey};
-use xsalsa20poly1305::{XSalsa20Poly1305, KeyInit};
-use xsalsa20poly1305::aead::Aead;
+use crypto_secretbox::{XSalsa20Poly1305, KeyInit};
+use crypto_secretbox::aead::Aead;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CryptoError {
@@ -50,7 +50,7 @@ impl EncryptionKey {
 
         let mut nonce_bytes = [0u8; 24];
         rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
-        let nonce = xsalsa20poly1305::Nonce::from(nonce_bytes);
+        let nonce = crypto_secretbox::Nonce::from(nonce_bytes);
 
         let ciphertext = cipher.encrypt(&nonce, plaintext)
             .map_err(|_| CryptoError::EncryptionFailed)?;
@@ -62,7 +62,7 @@ impl EncryptionKey {
         let shared = self.derive_shared_key(peer_pubkey)?;
 
         let cipher = XSalsa20Poly1305::new((&shared).into());
-        let nonce = xsalsa20poly1305::Nonce::from(msg.nonce);
+        let nonce = crypto_secretbox::Nonce::from(msg.nonce);
 
         cipher.decrypt(&nonce, msg.ciphertext.as_slice())
             .map_err(|_| CryptoError::DecryptionFailed)

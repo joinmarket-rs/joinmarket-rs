@@ -35,9 +35,9 @@ joinmarket-rs/
 │       │   ├── server.rs             # accept loop + connection manager
 │       │   ├── peer.rs               # per-peer state machine
 │       │   ├── router.rs             # ShardedRegistry + broadcast channel
-│       │   ├── admission.rs          # AdmissionController (all 5 defence layers)
-│       │   ├── sybil_guard.rs        # Layer 3: onion → one active nick
-│       │   ├── bond_registry.rs      # Layer 4: UTXO deduplication
+│       │   ├── admission.rs          # AdmissionController (all 4 defence layers)
+│       │   ├── sybil_guard.rs        # Layer 2: onion → one active nick
+│       │   ├── bond_registry.rs      # Layer 3: UTXO deduplication
 │       │   ├── heartbeat.rs          # !ping/!pong liveness tracking
 │       │   └── metrics.rs            # Prometheus counters/gauges
 │       └── tests/
@@ -560,18 +560,14 @@ All five layers are enforced in order. A connection that fails any layer is reje
 
 ```rust
 pub struct AdmissionController {
-    connection_rate: ConnectionRateLimiter,  // Layer 2
-    sybil_guard:     SybilGuard,             // Layer 3
-    bond_registry:   FidelityBondRegistry,   // Layer 4
-    maker_throttle:  MakerThrottle,          // Layer 5
+    sybil_guard:   SybilGuard,             // Layer 2
+    bond_registry: FidelityBondRegistry,   // Layer 3
+    maker_count:   AtomicU32,              // Layer 4
     // Layer 1 (Tor PoW) is enforced by Arti before any Rust code runs
     // (arti feature only; not available for the tordaemon backend)
 }
 
 impl AdmissionController {
-    // Call immediately after accept(), before reading any bytes
-    pub fn check_connection(&self, onion_addr: &str) -> Result<(), AdmissionError>;
-
     // Call after successful handshake parse, before registering in Router
     pub fn admit_peer(
         &self,
@@ -590,18 +586,7 @@ impl AdmissionController {
 
 Disabled by default. Available only for arti builds (`--features arti`). When `--pow` is passed, Arti calls `enable_pow(true)` and `pow_rend_queue_depth(200)` on the `OnionServiceConfig` builder (requires the `hs-pow-full` Cargo feature, included automatically). Dynamic Equi-X puzzle, effort scales automatically with queue depth, dormant when not under load. `--pow` is not available for tordaemon builds — operators must configure PoW in `torrc` manually for C Tor.
 
-#### Layer 2 — Connection Rate Limiter (`admission.rs`)
-
-```rust
-// Sliding 60-second window per onion address
-const MAX_CONNECTIONS_PER_ONION_PER_MINUTE: u32 = 3;
-
-pub struct ConnectionRateLimiter {
-    windows: DashMap<String, RateWindow>,  // onion_addr → sliding window
-}
-```
-
-#### Layer 3 — Sybil Guard (`sybil_guard.rs`)
+#### Layer 2 — Sybil Guard (`sybil_guard.rs`)
 
 One active nick per onion address. If onion A already has nick X registered and attempts to register nick Y while X is still live, reject Y. If X has already disconnected (stale), allow Y (legitimate restart).
 
@@ -625,7 +610,7 @@ impl SybilGuard {
 }
 ```
 
-#### Layer 4 — Fidelity Bond UTXO Deduplication (`bond_registry.rs`)
+#### Layer 3 — Fidelity Bond UTXO Deduplication (`bond_registry.rs`)
 
 One fidelity bond UTXO may only be claimed by one nick at a time. Prevents a single locked UTXO from inflating its weight across many nicks.
 
@@ -643,17 +628,13 @@ impl FidelityBondRegistry {
 
 Note: directory node does NOT verify bond against Bitcoin blockchain (`no-blockchain`). Takers verify independently. Deduplication alone is sufficient to prevent weight inflation.
 
-#### Layer 5 — Maker Registration Throttle (`admission.rs`)
+#### Layer 4 — Maker Capacity Cap (`admission.rs`)
 
 ```rust
-const MAX_NEW_MAKER_REGISTRATIONS_PER_MINUTE: u32 = 60;
 const MAX_CONCURRENT_MAKERS: u32 = 100_000;
-
-pub struct MakerThrottle {
-    recent_registrations: Mutex<VecDeque<Instant>>,
-    current_count: AtomicU32,
-}
 ```
+
+Atomically reserves a slot via `fetch_add`; rolls back all prior layers on failure.
 
 ### `heartbeat.rs`
 
@@ -698,10 +679,9 @@ jm_router_locate_duration_seconds       histogram
 
 # Admission defence layer hits
 jm_admission_invalid_onion_total           counter  # bad location-string → disconnect
-jm_admission_rate_limit_rejections_total   counter  # Layer 2
-jm_admission_sybil_rejections_total        counter  # Layer 3
-jm_admission_bond_dup_rejections_total     counter  # Layer 4
-jm_admission_maker_cap_rejections_total    counter  # Layer 5
+jm_admission_sybil_rejections_total        counter  # Layer 2
+jm_admission_bond_dup_rejections_total     counter  # Layer 3
+jm_admission_maker_cap_rejections_total    counter  # Layer 4
 
 # Tor
 # jm_pow_effort_current: not implemented — tor-hsservice 0.40 exposes no API

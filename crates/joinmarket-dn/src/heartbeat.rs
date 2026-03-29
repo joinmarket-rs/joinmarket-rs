@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use joinmarket_core::message::{OnionEnvelope, msg_type};
-use crate::admission::AdmissionController;
 use crate::router::Router;
 
 /// How often to sweep for idle peers.
@@ -17,7 +16,7 @@ const HARD_EVICT_THRESHOLD_SECS: u64 = 900; // 15 min
 /// How long to wait for a !pong after sending !ping to a ping-capable peer.
 const PONG_TIMEOUT_SECS: u64 = 30;
 
-pub async fn heartbeat_loop(router: Arc<Router>, admission: Arc<AdmissionController>, shutdown: CancellationToken) {
+pub async fn heartbeat_loop(router: Arc<Router>, shutdown: CancellationToken) {
     // Delay first sweep so we don't evict peers that just connected.
     let start = tokio::time::Instant::now() + Duration::from_secs(IDLE_CHECK_INTERVAL_SECS);
     let mut interval = tokio::time::interval_at(start, Duration::from_secs(IDLE_CHECK_INTERVAL_SECS));
@@ -41,9 +40,6 @@ pub async fn heartbeat_loop(router: Arc<Router>, admission: Arc<AdmissionControl
                         tracing::debug!(%nick, "Hard evicted (idle > 15 min)");
                     }
                 }
-
-                // Cleanup stale rate-limit entries to prevent memory leaks.
-                admission.cleanup_stale_rate_windows();
 
                 // Step 2: Send !ping probes to ping-capable peers idle > 5 min.
                 // Non-ping peers (Python clients) receive no probe — they will be

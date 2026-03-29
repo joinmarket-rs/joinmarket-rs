@@ -194,16 +194,7 @@ pub async fn handle_peer(
     let is_maker = peer_role == PeerRole::Maker;
     let bond = peer_handshake.fidelity_bond();
 
-    // Layer 2: Per-onion connection rate limit (moved here from accept loop
-    // where it was keyed on circuit_id, which is unique per connection)
-    if let Some(ref onion) = peer_onion {
-        if let Err(e) = admission.check_connection(onion.host.as_str()) {
-            tracing::warn!(nick = %nick, error = %e, "Connection rate-limited by onion");
-            return;
-        }
-    }
-
-    // Admission control (layers 3, 4, 5) — only for makers (who have an onion addr)
+    // Admission control (layers 2, 3, 4) — only for makers (who have an onion addr)
     if let Some(ref onion) = peer_onion {
         if let Err(e) = admission.admit_peer(nick.as_ref(), onion, is_maker, bond.as_ref()) {
             tracing::warn!(nick = %nick, error = %e, "Admission rejected");

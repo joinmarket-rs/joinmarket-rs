@@ -138,9 +138,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Start heartbeat loop
     let hb_router = router.clone();
-    let hb_admission = admission.clone();
     let hb_shutdown = shutdown.clone();
-    let hb_handle = tokio::spawn(heartbeat::heartbeat_loop(hb_router, hb_admission, hb_shutdown));
+    let hb_handle = tokio::spawn(heartbeat::heartbeat_loop(hb_router, hb_shutdown));
 
     // Run accept loop (blocks until shutdown)
     server::run_accept_loop(

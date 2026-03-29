@@ -70,9 +70,9 @@ joinmarket-rs/
 │       ├── server.rs          # Accept loop
 │       ├── peer.rs            # Per-peer state machine
 │       ├── router.rs          # ShardedRegistry + broadcast channel
-│       ├── admission.rs       # AdmissionController (defence layers 2–5)
-│       ├── sybil_guard.rs     # Layer 3: one active nick per onion
-│       ├── bond_registry.rs   # Layer 4: UTXO deduplication
+│       ├── admission.rs       # AdmissionController (defence layers 2–4)
+│       ├── sybil_guard.rs     # Layer 2: one active nick per onion
+│       ├── bond_registry.rs   # Layer 3: UTXO deduplication
 │       ├── heartbeat.rs       # Periodic liveness loop
 │       └── metrics.rs         # Prometheus counters/gauges
 │
@@ -204,15 +204,14 @@ RUST_LOG=joinmarket_dn=trace,joinmarket_core=info joinmarket-dn
 
 ## DoS defence layers
 
-The directory node implements five layers of defence against abuse:
+The directory node implements four layers of defence against abuse:
 
 | Layer | Mechanism | Default |
 |-------|-----------|---------|
 | 1 | Tor PoW (Equi-X puzzles) | Off — `--pow` enables it with the `arti` backend; with `tordaemon`, PoW is configured externally via C Tor |
-| 2 | Connection rate limit: 3 connections/minute per onion | Always on |
-| 3 | Sybil guard: one active nick per onion address | Always on |
-| 4 | Fidelity bond UTXO deduplication | Always on |
-| 5 | Maker registration throttle: 60 new makers/minute, 100k cap | Always on |
+| 2 | Sybil guard: one active nick per onion address | Always on |
+| 3 | Fidelity bond UTXO deduplication | Always on |
+| 4 | Maker capacity cap: 100k concurrent makers | Always on |
 
 **PoW note:** `--pow` is only available with the `arti` backend and activates Equi-X PoW puzzles at runtime. With the `tordaemon` backend, PoW is configured externally through C Tor itself (requires a `tor` binary compiled with `--enable-gpl`); the directory node has no way to detect whether C Tor has PoW enabled.
 

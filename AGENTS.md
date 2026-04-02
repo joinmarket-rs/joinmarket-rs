@@ -8,8 +8,7 @@ sharing common protocol logic via the `joinmarket-core` library crate. Additiona
 generator, coinjoin client, wallet) will follow in later phases as the core library matures.
 
 **Why Rust?** The Python JoinMarket toolchain is hard to install (pip, virtualenvs, native
-dependencies) and operationally fragile — especially the directory node, which leaks memory under
-load, crashes on unexpected peer input, and requires constant babysitting. A Rust rewrite provides:
+dependencies) and operationally fragile — especially the directory node, which consumes more memory as connections scale, can leave peers in inconsistent states on unexpected input, and requires ongoing operator attention. A Rust rewrite provides:
 - **Single statically-linked binary** — no Python, no pip, no virtualenv. Download and run.
 - **Memory-safe and crash-resistant** — no uncaught exceptions, predictable memory use.
 - **Designed for scale** — 100k+ concurrent peer connections on a single server.

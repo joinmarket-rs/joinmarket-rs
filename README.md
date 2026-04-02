@@ -4,16 +4,16 @@ A full Rust rewrite of [JoinMarket](https://github.com/JoinMarket-Org/joinmarket
 
 ## Why rewrite in Rust?
 
-JoinMarket is hard to install. The Python toolchain, `pip`, virtualenvs, and a growing list of native dependencies make it inaccessible for non-technical operators — precisely the people most needed to run infrastructure like directory nodes.
+JoinMarket is hard to install. The Python toolchain, `pip`, virtualenvs, and a growing list of native dependencies make it inaccessible for many users.
 
-The directory node in particular has had reliability and stability issues in the Python implementation: memory growth under load, unhandled exceptions crashing the process, and difficulty deploying it as a hardened system service.
+The directory node in particular has had reliability and stability issues in the Python implementation: growing memory consumption under load, fragile error handling that can leave peers in inconsistent states, and difficulty deploying it as a hardened system service.
 
 A Rust rewrite addresses both problems:
 
 - **Single statically-linked binary** — no Python, no pip, no virtualenv. Download and run.
 - **Memory-safe and crash-resistant** — no uncaught exceptions, predictable memory use
 - **Designed for scale** — 100k+ concurrent peer connections on a single server
-- **Easy to package** — one file, no runtime dependencies, works on any modern Linux
+- **Easy to package** — one file, no runtime dependencies, works on any modern Linux, macOS, or Windows
 
 Programs ship as pre-built static binaries for Linux (x86\_64 and aarch64), macOS (Apple Silicon and Intel), and Windows (x86\_64) as well as source. Building from source requires only `rustup` — no system libraries, no C toolchain beyond what Rust itself needs.
 
@@ -23,7 +23,7 @@ Programs ship as pre-built static binaries for Linux (x86\_64 and aarch64), macO
 |---------|-------|-------------|--------|
 | Directory node | [`joinmarket-dn`](#joinmarket-dn--directory-node) | Rendezvous server for maker/taker peer discovery | Alpha |
 
-Additional tools (yield generator, coinjoin client, wallet) will follow in later phases as the core library matures.
+Additional tools (maker, taker, wallet) will follow in later phases as the core library matures.
 
 ---
 
@@ -31,19 +31,19 @@ Additional tools (yield generator, coinjoin client, wallet) will follow in later
 
 The first program in the suite. A pure-Rust reimplementation of `start-dn.py`.
 
-The Python directory node (`start-dn.py`) has been the most operationally painful part of running JoinMarket infrastructure. It requires a full Python environment, leaks memory under sustained load, and crashes on unexpected input from peers. Running it reliably as a system service requires considerable babysitting.
+The directory node is a critical piece of JoinMarket infrastructure — it is the rendezvous point through which every maker and taker discovers each other. The Python implementation (`start-dn.py`) requires a full Python environment, uses significantly more memory per connection, and can leave peers in inconsistent states on unexpected input. Running it reliably as a system service requires considerable effort.
 
-`joinmarket-dn` replaces it with a single binary: drop it on a server, point it at a Tor hidden service directory, and run it under systemd. It handles 100k+ concurrent peer connections and is fully wire-compatible with existing Python JoinMarket clients.
+`joinmarket-dn` replaces it with a single binary: drop it on a server, point it at a Tor hidden service directory, and run it under systemd. It is designed to handle over 100k concurrent peer connections and is fully wire-compatible with existing Python JoinMarket clients.
 
 The directory node is a lightweight rendezvous server for the JoinMarket coinjoin protocol:
 
 - Accepts inbound connections from JoinMarket maker and taker peers over Tor
 - Performs a JSON handshake and maintains a nick → onion registry
-- Relays public messages (`!ann`, `!orderbook`) by broadcast to all connected peers
-- Routes private messages by returning the target peer's onion address (peers then connect directly — the directory does **not** relay private content)
-- Responds to `!getpeers` with the full maker list (or a bond-weighted sample at scale)
+- Relays public messages (offers, orderbook requests) by broadcast to all connected peers
+- Relays private messages to the target peer and sends the sender's onion address so peers can connect directly
+- Responds to peer list requests with the full maker list (or a bond-weighted sample at scale)
 - Broadcasts an operator MOTD during handshake
-- Requires no Bitcoin node, no wallet, no blockchain access
+- Requires no Bitcoin node or wallet
 
 ## Workspace layout
 
@@ -146,12 +146,7 @@ cargo test -p joinmarket-dn
 cargo test -p joinmarket-core onion::tests::test_valid_v3_address
 ```
 
-There are currently **106 tests** across the workspace:
-
-| Crate | Tests |
-|-------|-------|
-| `joinmarket-core` | 68 (nick, onion, message, handshake, crypto, fidelity bond, config) |
-| `joinmarket-dn` | 22 unit + 16 integration (router, sybil guard, bond registry, admission control, end-to-end) |
+Tests cover nick generation, onion address validation, message parsing, handshake logic, crypto primitives, fidelity bonds, config parsing, routing, sybil guard, bond registry, admission control, and end-to-end integration.
 
 ## Running
 
@@ -212,18 +207,21 @@ The directory node implements four layers of defence against abuse:
 | 2 | Sybil guard: one active nick per onion address | Always on |
 | 3 | Fidelity bond UTXO deduplication | Always on |
 | 4 | Maker capacity cap: 100k concurrent makers | Always on |
+| 5 | Per-peer pubmsg rate limit: 30 messages per minute | Always on |
 
 **PoW note:** `--pow` is only available with the `arti` backend and activates Equi-X PoW puzzles at runtime. With the `tordaemon` backend, PoW is configured externally through C Tor itself (requires a `tor` binary compiled with `--enable-gpl`); the directory node has no way to detect whether C Tor has PoW enabled.
 
 ## Peer routing
 
-| Message | Behaviour |
-|---------|-----------|
-| `!ann`, `!orderbook` | Broadcast to all connected peers |
-| `!getpeers` | Return full maker list (≤20k) or bond-weighted sample (>20k) |
-| `!fill <nick> ...` | Look up target nick's onion address and return it to the sender; sender connects directly |
-| `!ping` | Reply `!pong` |
-| `!disconnect` | Close connection cleanly |
+Routing is driven by **envelope types** (integer discriminators), not `!`-prefixed commands.
+
+| Envelope type | Behaviour |
+|---------------|-----------|
+| `PUBMSG` (687) | Broadcast to all connected peers (carries `!`-prefixed application commands like `!sw0absoffer`, `!orderbook`) |
+| `PRIVMSG` (685) | Forward to the target peer; DN also sends the sender's onion address to the target via `PEERLIST` |
+| `GETPEERLIST` (791) | Return full maker list (≤20k) or bond-weighted sample (>20k) as a `PEERLIST` (789) response |
+| `PING` (797) | DN sends liveness probe; peer replies with `PONG` (799) |
+| `DISCONNECT` (801) | Close connection cleanly |
 
 ## Memory target
 
@@ -273,15 +271,30 @@ net.ipv4.tcp_max_syn_backlog = 65535
 net.netfilter.nf_conntrack_max = 2000000
 ```
 
+**Arti backend note:** When built with the `arti` feature, Tor runs inside the DN process itself. The process makes outbound TCP connections to Tor relays in addition to accepting peer connections, so you may also need:
+
+```bash
+# Expand ephemeral port range for Arti's outbound Tor relay connections
+net.ipv4.ip_local_port_range = 1024 65535
+
+# Allow larger buffers for Tor relay traffic (the defaults above are
+# tuned for JoinMarket's small messages on local sockets)
+net.ipv4.tcp_rmem = 4096 16384 131072
+net.ipv4.tcp_wmem = 4096 16384 131072
+```
+
+You should also increase `LimitNOFILE` in the systemd unit to account for both peer sockets and Tor relay connections.
+
 ## Implementation status
 
 | Phase | Scope | Status |
 |-------|-------|--------|
-| 1 | `joinmarket-core`: nick, onion, message, handshake, crypto, fidelity bond, config | Complete |
-| 2 | `joinmarket-tor`: TorProvider trait, MockTorProvider; Arti backend (feature-flagged) | Trait + mock complete; Arti backend pending |
-| 3 | `joinmarket-dn`: accept loop, peer state machine, router, admission control | Complete (using mock Tor) |
-| 4 | Interoperability testing against Python JoinMarket client on signet | Pending |
-| 5 | Heartbeat eviction, Prometheus metrics, structured tracing, load testing | Pending |
+| 1 | `joinmarket-core`: nick, onion, message, handshake, crypto, fidelity bond, config | Ongoing |
+| 2 | `joinmarket-tor`: TorProvider trait, MockTorProvider, C Tor daemon backend, Arti embedded backend | Complete |
+| 3 | `joinmarket-dn`: accept loop, peer state machine, router, admission control, heartbeat, metrics | Complete |
+| 4 | Interoperability testing against Python JoinMarket client on signet | Complete |
+| 5 | Heartbeat eviction, Prometheus metrics, structured tracing | Complete |
+| 6 | Production load testing with real-world traffic | Pending |
 
 ## License
 

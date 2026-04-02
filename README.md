@@ -86,7 +86,7 @@ joinmarket-rs/
 
 ```bash
 # Clone and build all crates
-git clone https://github.com/takinbrrrr/joinmarket-rs
+git clone https://github.com/joinmarket-rs/joinmarket-rs
 cd joinmarket-rs
 cargo build --release
 

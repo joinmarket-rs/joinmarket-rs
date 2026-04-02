@@ -54,6 +54,7 @@ Desktop.ini
 .env
 .env.*
 !.env.example
+.envrc
 
 # Tor / keys (never commit private key material)
 hs_ed25519_secret_key

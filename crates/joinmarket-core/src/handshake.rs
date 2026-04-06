@@ -68,6 +68,9 @@ impl PeerHandshake {
         if self.app_name != "joinmarket" {
             return Err(HandshakeError::WrongAppName(self.app_name.clone()));
         }
+        if self.directory {
+            return Err(HandshakeError::DirectoryNotAccepted);
+        }
         if self.proto_ver != CURRENT_PROTO_VER {
             return Err(HandshakeError::ProtoVerMismatch {
                 expected: CURRENT_PROTO_VER,
@@ -129,6 +132,8 @@ pub enum HandshakeError {
     ProtoVerMismatch { expected: u8, got: u8 },
     #[error("network mismatch: expected '{expected}', got '{got}'")]
     NetworkMismatch { expected: String, got: String },
+    #[error("directory nodes not accepted as peers")]
+    DirectoryNotAccepted,
     #[error("malformed nick")]
     MalformedNick,
     #[error("too many features entries: {0} (max {})", MAX_FEATURES_ENTRIES)]
@@ -201,11 +206,12 @@ mod tests {
     }
 
     #[test]
-    fn test_directory_node_handshake() {
+    fn test_directory_node_handshake_rejected() {
         let json = r#"{"app-name":"joinmarket","directory":true,"location-string":"2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion:5222","proto-ver":5,"features":{},"nick":"J5xhGSWE7VrxM7sO","network":"mainnet"}"#;
         let msg = PeerHandshake::parse_json(json).unwrap();
         assert!(msg.directory);
-        assert!(msg.validate("mainnet").is_ok());
+        let err = msg.validate("mainnet").unwrap_err();
+        assert!(matches!(err, HandshakeError::DirectoryNotAccepted));
     }
 
     #[test]

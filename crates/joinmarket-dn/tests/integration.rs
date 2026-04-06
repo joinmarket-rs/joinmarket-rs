@@ -13,6 +13,7 @@ use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 
 use joinmarket_dn::{admission, router, server};
+use joinmarket_core::handshake::CURRENT_PROTO_VER;
 use joinmarket_core::message::{OnionEnvelope, msg_type};
 use joinmarket_tor::mock::MockTorProvider;
 
@@ -554,6 +555,253 @@ async fn test_privmsg_from_nick_mismatch_disconnects() {
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(router.taker_count(), 0, "spoofing peer should be disconnected");
+
+    shutdown.cancel();
+}
+
+// ── Handshake edge-case tests ───────────────────────────────────────────────
+
+const NICK_EDGE: &str = "J5edgeCaseOOOOOO"; // 16 chars
+
+/// Build a raw handshake JSON with arbitrary field overrides.
+fn custom_handshake_json(
+    app_name: &str,
+    directory: bool,
+    location_string: &str,
+    proto_ver: u32,
+    nick: &str,
+    network: &str,
+) -> String {
+    format!(
+        "{{\"app-name\":\"{app_name}\",\"directory\":{directory},\
+         \"location-string\":\"{location_string}\",\
+         \"proto-ver\":{proto_ver},\"features\":{{}},\"nick\":\"{nick}\",\
+         \"network\":\"{network}\"}}"
+    )
+}
+
+/// Helper: send a custom handshake envelope and return whatever the server
+/// sends back (if anything within 2 s).  Returns `None` on timeout / EOF.
+async fn send_custom_handshake(
+    reader: &mut BufReader<tokio::io::ReadHalf<TcpStream>>,
+    writer: &mut tokio::io::WriteHalf<TcpStream>,
+    payload_json: &str,
+) -> Option<OnionEnvelope> {
+    let envelope = wrap_in_handshake_envelope(payload_json);
+    writer.write_all(envelope.as_bytes()).await.unwrap();
+    writer.flush().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), read_envelope(reader))
+        .await
+        .ok()
+        .flatten()
+}
+
+
+
+#[tokio::test]
+async fn test_wrong_app_name_disconnects() {
+    let (tor, router, shutdown) = start_test_server().await;
+
+    let (mut reader, mut writer) = connect_to_server(&tor).await;
+
+    let hs = custom_handshake_json(
+        "WrongApp", false, MAKER_ONION, 5, NICK_EDGE, "mainnet",
+    );
+    let _resp = send_custom_handshake(&mut reader, &mut writer, &hs).await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(router.maker_count(), 0, "wrong app-name peer should not be a maker");
+    assert_eq!(router.taker_count(), 0, "wrong app-name peer should not be a taker");
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_proto_ver_too_old_disconnects() {
+    let (tor, router, shutdown) = start_test_server().await;
+
+    let (mut reader, mut writer) = connect_to_server(&tor).await;
+
+    let hs = custom_handshake_json(
+        "joinmarket", false, MAKER_ONION, (CURRENT_PROTO_VER - 1) as u32, NICK_EDGE, "mainnet",
+    );
+    let resp = send_custom_handshake(&mut reader, &mut writer, &hs).await;
+
+    // Server may send a rejected response before closing
+    if let Some(env) = resp {
+        assert!(
+            env.line.contains("\"accepted\":false"),
+            "expected rejected handshake, got: {}", env.line
+        );
+    }
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(router.maker_count(), 0);
+    assert_eq!(router.taker_count(), 0);
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_proto_ver_too_new_disconnects() {
+    let (tor, router, shutdown) = start_test_server().await;
+
+    let (mut reader, mut writer) = connect_to_server(&tor).await;
+
+    let hs = custom_handshake_json(
+        "joinmarket", false, MAKER_ONION, (CURRENT_PROTO_VER as u32) + 1, NICK_EDGE, "mainnet",
+    );
+    let resp = send_custom_handshake(&mut reader, &mut writer, &hs).await;
+
+    if let Some(env) = resp {
+        assert!(
+            env.line.contains("\"accepted\":false"),
+            "expected rejected handshake, got: {}", env.line
+        );
+    }
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(router.maker_count(), 0);
+    assert_eq!(router.taker_count(), 0);
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_directory_flag_rejected() {
+    let (tor, router, shutdown) = start_test_server().await;
+
+    let (mut reader, mut writer) = connect_to_server(&tor).await;
+
+    // Peer claims to be a directory node
+    let hs = custom_handshake_json(
+        "joinmarket", true, MAKER_ONION, 5, NICK_EDGE, "mainnet",
+    );
+    let _resp = send_custom_handshake(&mut reader, &mut writer, &hs).await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Directory-to-directory connections must be rejected
+    assert_eq!(router.maker_count(), 0, "directory peer should not be registered as maker");
+    assert_eq!(router.taker_count(), 0, "directory peer should not be registered as taker");
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_missing_handshake_fields_disconnects() {
+    let (tor, router, shutdown) = start_test_server().await;
+
+    let (mut reader, mut writer) = connect_to_server(&tor).await;
+
+    // JSON with only app-name and proto-ver — missing nick, network, etc.
+    let incomplete_json = r#"{"app-name":"joinmarket","proto-ver":5}"#;
+    let _resp = send_custom_handshake(&mut reader, &mut writer, incomplete_json).await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(router.maker_count(), 0);
+    assert_eq!(router.taker_count(), 0);
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_invalid_json_handshake_disconnects() {
+    let (tor, router, shutdown) = start_test_server().await;
+
+    let (_reader, mut writer) = connect_to_server(&tor).await;
+
+    // Send a valid envelope but with garbage (non-JSON) as the inner payload
+    let garbage_envelope = OnionEnvelope::new(
+        msg_type::HANDSHAKE, "this is not json at all",
+    ).serialize();
+    writer.write_all(garbage_envelope.as_bytes()).await.unwrap();
+    writer.flush().await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(router.maker_count(), 0);
+    assert_eq!(router.taker_count(), 0);
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_lenient_location_string_treated_as_taker() {
+    let (tor, router, shutdown) = start_test_server().await;
+
+    let (mut reader, mut writer) = connect_to_server(&tor).await;
+
+    // Bare port number — some legacy/buggy clients send this.
+    // It is not a valid onion address, so the peer should either be treated
+    // as a taker (lenient) or disconnected (strict). Both are acceptable as
+    // long as it is NEVER registered as a maker.
+    let hs = custom_handshake_json(
+        "joinmarket", false, "9050", 5, NICK_EDGE, "mainnet",
+    );
+    let resp = send_custom_handshake(&mut reader, &mut writer, &hs).await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    match resp {
+        Some(env) if env.line.contains("\"accepted\":true") => {
+            // Lenient path: accepted as taker
+            assert_eq!(router.taker_count(), 1, "lenient: should be registered as taker");
+        }
+        _ => {
+            // Strict path: disconnected
+            assert_eq!(router.taker_count(), 0);
+        }
+    }
+
+    // Invariant either way: must NEVER be a maker.
+    assert_eq!(router.maker_count(), 0, "malformed location must not produce a maker");
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_handshake_timeout_disconnects() {
+    let (tor, router, shutdown) = start_test_server().await;
+
+    // Connect but never send anything — server should time out after 10 s
+    let (_reader, _writer) = connect_to_server(&tor).await;
+
+    // Wait longer than the 10-second handshake timeout
+    tokio::time::sleep(Duration::from_secs(12)).await;
+
+    // The silent peer must not be registered
+    assert_eq!(router.maker_count(), 0);
+    assert_eq!(router.taker_count(), 0);
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_not_serving_onion_accepted_as_taker() {
+    // Complements test_not_serving_onion_taker by also verifying the DN
+    // response explicitly contains "accepted":true.
+    let (tor, router, shutdown) = start_test_server().await;
+
+    let (mut reader, mut writer) = connect_to_server(&tor).await;
+    let dn_resp = do_handshake(
+        &mut reader, &mut writer, NICK_EDGE, "NOT-SERVING-ONION",
+    ).await;
+
+    assert_eq!(dn_resp.msg_type, msg_type::DN_HANDSHAKE);
+    assert!(
+        dn_resp.line.contains("\"accepted\":true"),
+        "NOT-SERVING-ONION should be accepted, got: {}", dn_resp.line
+    );
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert_eq!(router.maker_count(), 0, "NOT-SERVING-ONION must not register as maker");
+    assert_eq!(router.taker_count(), 1, "NOT-SERVING-ONION should register as taker");
 
     shutdown.cancel();
 }

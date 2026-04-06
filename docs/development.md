@@ -72,7 +72,8 @@
 
 1. Start Rust DN in-process (with mock Tor provider)
 1. Connect two mock peers (one Maker, one Taker)
-1. Assert Maker receives broadcast of Taker's offer (e.g. `!sw0absoffer`) and vice versa
+1. Assert offer commands (`!sw0absoffer`, `!cancel`, `!tbond`) are delivered to Takers but **not** to Makers
+1. Assert all-peers commands (`!orderbook`, `!hp2`) are delivered to both Makers and Takers
 1. Assert `GETPEERLIST` (envelope type 791) returns only the Maker
 1. Assert PRIVMSG routing forwards to the target peer
 1. Assert PING / PONG (envelope types 797/799) heartbeat clears disconnected peers

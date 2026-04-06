@@ -104,7 +104,16 @@ Commands are `!`-prefixed, whitespace-delimited, newline-terminated. Maximum lin
 | `!hp2` | PoDLE commitment broadcast |
 | `!tbond` | Fidelity bond proof announcement |
 
-The DN broadcasts all recognized public commands to every connected peer (except the sender). Offer commands additionally update the maker's last announcement record.
+The DN routes public commands to one of two broadcast channels depending on the command type:
+
+| Channel | Subscribers | Commands |
+|---------|-------------|----------|
+| All-peers | Makers + Takers | `!orderbook`, `!hp2` |
+| Takers-only | Takers only | All offer variants, `!cancel`, `!tbond` |
+
+Makers must receive `!orderbook` to know when to re-announce their offers, and `!hp2` PoDLE commitments to guard against double-spend before accepting a `!fill`. They have no use for other makers' offer announcements, cancellations, or fidelity bond proofs — routing those to the takers-only channel avoids the O(n²) write amplification that occurs when thousands of makers simultaneously respond to an `!orderbook` burst.
+
+Offer commands additionally update the sender's `last_ann` record in the makers registry (if the sender is a Maker). The sender never receives its own message back (echo filter applied on both channels).
 
 ### Private commands (via PRIVMSG type 685)
 

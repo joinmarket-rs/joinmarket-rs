@@ -559,7 +559,263 @@ async fn test_privmsg_from_nick_mismatch_disconnects() {
     shutdown.cancel();
 }
 
-// ── Handshake edge-case tests ───────────────────────────────────────────────
+// ── Dual broadcast channel routing tests ───────────────────────────────────
+//
+// These tests confirm which commands reach which peer types.
+//
+// Test strategy for maker isolation: the taker sends the taker-only command
+// (offer/cancel/tbond) with its own nick, so no second maker onion is needed.
+// The DN routes on command type, not sender role.  The maker then receives a
+// follow-up all-peers command (`!orderbook`) to prove it is alive and connected
+// — if the maker's first received message is `!orderbook` and not the earlier
+// taker-only command, channel isolation is confirmed.
+
+const NICK_CH_MAKER:   &str = "J5chanMakerOOOOO"; // 16 chars
+const NICK_CH_TAKER_A: &str = "J5chanTakerAOOOO"; // 16 chars
+const NICK_CH_TAKER_B: &str = "J5chanTakerBOOOO"; // 16 chars
+
+/// Offer commands (`!sw0absoffer`, `!absoffer`, etc.) must reach takers but
+/// must NOT be delivered to makers.  After verifying the taker has received
+/// the offer, the maker is confirmed alive by sending `!orderbook` and
+/// checking that the maker's first message is `!orderbook`, not the offer.
+#[tokio::test]
+async fn test_offer_delivered_to_taker_not_maker() {
+    let (tor, _router, shutdown) = start_test_server().await;
+
+    let (mut maker_r, mut maker_w) = connect_to_server(&tor).await;
+    maker_handshake(&mut maker_r, &mut maker_w, NICK_CH_MAKER).await;
+
+    let (mut taker_r, mut taker_w) = connect_to_server(&tor).await;
+    taker_handshake(&mut taker_r, &mut taker_w, NICK_CH_TAKER_A).await;
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Taker sends !sw0absoffer with its own nick as from_nick.
+    // The DN routes on command type — this must go to the taker-only channel.
+    let offer_line = format!("{}!PUBLIC!sw0absoffer minsize=27300", NICK_CH_TAKER_A);
+    let offer_env = OnionEnvelope::new(msg_type::PUBMSG, offer_line).serialize();
+    taker_w.write_all(offer_env.as_bytes()).await.unwrap();
+    taker_w.flush().await.unwrap();
+
+    // Maker must NOT receive the offer within a generous timeout.
+    // An all-peers delivery would have arrived well within 500 ms.
+    let maker_early = tokio::time::timeout(
+        Duration::from_millis(500),
+        read_envelope(&mut maker_r),
+    ).await;
+    assert!(
+        maker_early.is_err() || maker_early.unwrap().is_none(),
+        "offer must NOT be delivered to a maker peer"
+    );
+
+    // Taker sends !orderbook — an all-peers command — to prove the maker is
+    // still alive and has a functioning receive path.
+    let ob_line = format!("{}!PUBLIC!orderbook", NICK_CH_TAKER_A);
+    let ob_env = OnionEnvelope::new(msg_type::PUBMSG, ob_line).serialize();
+    taker_w.write_all(ob_env.as_bytes()).await.unwrap();
+    taker_w.flush().await.unwrap();
+
+    // Maker receives !orderbook (all-peers channel), confirming it is alive.
+    let maker_msg = read_envelope(&mut maker_r)
+        .await
+        .expect("maker must receive !orderbook on the all-peers channel");
+    assert_eq!(maker_msg.msg_type, msg_type::PUBMSG);
+    assert!(
+        maker_msg.line.contains("!orderbook"),
+        "expected !orderbook, got: {}", maker_msg.line
+    );
+
+    shutdown.cancel();
+}
+
+/// `!cancel` informs takers that a maker is withdrawing an offer.  Takers
+/// must receive it; makers must not.
+#[tokio::test]
+async fn test_cancel_delivered_to_taker_not_maker() {
+    let (tor, _router, shutdown) = start_test_server().await;
+
+    let (mut maker_r, mut maker_w) = connect_to_server(&tor).await;
+    maker_handshake(&mut maker_r, &mut maker_w, NICK_CH_MAKER).await;
+
+    let (mut taker_r, mut taker_w) = connect_to_server(&tor).await;
+    taker_handshake(&mut taker_r, &mut taker_w, NICK_CH_TAKER_A).await;
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Taker sends !cancel (taker-only channel)
+    let cancel_line = format!("{}!PUBLIC!cancel 0", NICK_CH_TAKER_A);
+    let cancel_env = OnionEnvelope::new(msg_type::PUBMSG, cancel_line).serialize();
+    taker_w.write_all(cancel_env.as_bytes()).await.unwrap();
+    taker_w.flush().await.unwrap();
+
+    // Maker must not receive !cancel
+    let maker_early = tokio::time::timeout(
+        Duration::from_millis(500),
+        read_envelope(&mut maker_r),
+    ).await;
+    assert!(
+        maker_early.is_err() || maker_early.unwrap().is_none(),
+        "!cancel must NOT be delivered to a maker peer"
+    );
+
+    // Liveness check: maker receives a follow-up !orderbook
+    let ob_line = format!("{}!PUBLIC!orderbook", NICK_CH_TAKER_A);
+    taker_w.write_all(OnionEnvelope::new(msg_type::PUBMSG, ob_line).serialize().as_bytes()).await.unwrap();
+    taker_w.flush().await.unwrap();
+    let maker_msg = read_envelope(&mut maker_r).await.expect("maker must receive !orderbook");
+    assert!(maker_msg.line.contains("!orderbook"), "expected !orderbook, got: {}", maker_msg.line);
+
+    // Taker (sender of !cancel) should have received it via taker channel
+    // BUT the echo filter suppresses it since sender_nick == taker's own nick.
+    // Verify instead via a second taker observer on the same server instance
+    // (see test_cancel_received_by_second_taker below).
+
+    shutdown.cancel();
+}
+
+/// `!tbond` announces a maker's fidelity bond proof.  Takers use it to
+/// weight maker selection; makers have no use for it.
+#[tokio::test]
+async fn test_tbond_delivered_to_taker_not_maker() {
+    let (tor, _router, shutdown) = start_test_server().await;
+
+    let (mut maker_r, mut maker_w) = connect_to_server(&tor).await;
+    maker_handshake(&mut maker_r, &mut maker_w, NICK_CH_MAKER).await;
+
+    let (mut taker_r, mut taker_w) = connect_to_server(&tor).await;
+    taker_handshake(&mut taker_r, &mut taker_w, NICK_CH_TAKER_A).await;
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let tbond_line = format!("{}!PUBLIC!tbond proof-bytes", NICK_CH_TAKER_A);
+    taker_w.write_all(OnionEnvelope::new(msg_type::PUBMSG, tbond_line).serialize().as_bytes()).await.unwrap();
+    taker_w.flush().await.unwrap();
+
+    let maker_early = tokio::time::timeout(
+        Duration::from_millis(500),
+        read_envelope(&mut maker_r),
+    ).await;
+    assert!(
+        maker_early.is_err() || maker_early.unwrap().is_none(),
+        "!tbond must NOT be delivered to a maker peer"
+    );
+
+    // Liveness check
+    let ob_line = format!("{}!PUBLIC!orderbook", NICK_CH_TAKER_A);
+    taker_w.write_all(OnionEnvelope::new(msg_type::PUBMSG, ob_line).serialize().as_bytes()).await.unwrap();
+    taker_w.flush().await.unwrap();
+    let maker_msg = read_envelope(&mut maker_r).await.expect("maker must receive !orderbook");
+    assert!(maker_msg.line.contains("!orderbook"), "expected !orderbook, got: {}", maker_msg.line);
+
+    shutdown.cancel();
+}
+
+/// `!orderbook` is sent by takers to prompt makers to re-announce their
+/// offers.  It must reach makers via the all-peers channel.
+#[tokio::test]
+async fn test_orderbook_delivered_to_maker() {
+    let (tor, _router, shutdown) = start_test_server().await;
+
+    let (mut maker_r, mut maker_w) = connect_to_server(&tor).await;
+    maker_handshake(&mut maker_r, &mut maker_w, NICK_CH_MAKER).await;
+
+    let (mut _taker_r, mut taker_w) = connect_to_server(&tor).await;
+    taker_handshake(&mut _taker_r, &mut taker_w, NICK_CH_TAKER_A).await;
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let ob_line = format!("{}!PUBLIC!orderbook", NICK_CH_TAKER_A);
+    taker_w.write_all(OnionEnvelope::new(msg_type::PUBMSG, ob_line).serialize().as_bytes()).await.unwrap();
+    taker_w.flush().await.unwrap();
+
+    let maker_msg = read_envelope(&mut maker_r)
+        .await
+        .expect("maker must receive !orderbook on the all-peers channel");
+    assert_eq!(maker_msg.msg_type, msg_type::PUBMSG);
+    assert!(
+        maker_msg.line.contains("!orderbook"),
+        "expected !orderbook, got: {}", maker_msg.line
+    );
+    assert!(
+        maker_msg.line.contains(NICK_CH_TAKER_A),
+        "from_nick should be taker's nick, got: {}", maker_msg.line
+    );
+
+    shutdown.cancel();
+}
+
+/// `!hp2` is a PoDLE commitment broadcast that makers must verify before
+/// accepting a `!fill`.  It must reach makers via the all-peers channel.
+#[tokio::test]
+async fn test_hp2_delivered_to_maker() {
+    let (tor, _router, shutdown) = start_test_server().await;
+
+    let (mut maker_r, mut maker_w) = connect_to_server(&tor).await;
+    maker_handshake(&mut maker_r, &mut maker_w, NICK_CH_MAKER).await;
+
+    let (mut _taker_r, mut taker_w) = connect_to_server(&tor).await;
+    taker_handshake(&mut _taker_r, &mut taker_w, NICK_CH_TAKER_A).await;
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let hp2_line = format!("{}!PUBLIC!hp2 commitment-data", NICK_CH_TAKER_A);
+    taker_w.write_all(OnionEnvelope::new(msg_type::PUBMSG, hp2_line).serialize().as_bytes()).await.unwrap();
+    taker_w.flush().await.unwrap();
+
+    let maker_msg = read_envelope(&mut maker_r)
+        .await
+        .expect("maker must receive !hp2 on the all-peers channel");
+    assert_eq!(maker_msg.msg_type, msg_type::PUBMSG);
+    assert!(
+        maker_msg.line.contains("!hp2"),
+        "expected !hp2, got: {}", maker_msg.line
+    );
+
+    shutdown.cancel();
+}
+
+/// A second taker must also receive taker-only messages such as `!cancel`
+/// and `!sw0absoffer`, confirming these are broadcast to ALL takers (not
+/// just the directly connected one).
+#[tokio::test]
+async fn test_taker_only_commands_reach_all_takers() {
+    let (tor, _router, shutdown) = start_test_server().await;
+
+    // Two takers subscribe to the taker-only channel.
+    let (mut taker_a_r, mut taker_a_w) = connect_to_server(&tor).await;
+    taker_handshake(&mut taker_a_r, &mut taker_a_w, NICK_CH_TAKER_A).await;
+
+    let (mut taker_b_r, mut taker_b_w) = connect_to_server(&tor).await;
+    taker_handshake(&mut taker_b_r, &mut taker_b_w, NICK_CH_TAKER_B).await;
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Taker A sends !sw0absoffer
+    let offer_line = format!("{}!PUBLIC!sw0absoffer minsize=27300", NICK_CH_TAKER_A);
+    taker_a_w.write_all(OnionEnvelope::new(msg_type::PUBMSG, offer_line).serialize().as_bytes()).await.unwrap();
+    taker_a_w.flush().await.unwrap();
+
+    // Taker B (not the sender) must receive it on the taker channel.
+    let msg_b = read_envelope(&mut taker_b_r)
+        .await
+        .expect("taker B must receive !sw0absoffer");
+    assert_eq!(msg_b.msg_type, msg_type::PUBMSG);
+    assert!(msg_b.line.contains("!sw0absoffer"), "taker B got: {}", msg_b.line);
+
+    // Taker A sends !cancel
+    let cancel_line = format!("{}!PUBLIC!cancel 0", NICK_CH_TAKER_A);
+    taker_a_w.write_all(OnionEnvelope::new(msg_type::PUBMSG, cancel_line).serialize().as_bytes()).await.unwrap();
+    taker_a_w.flush().await.unwrap();
+
+    let cancel_b = read_envelope(&mut taker_b_r)
+        .await
+        .expect("taker B must receive !cancel");
+    assert!(cancel_b.line.contains("!cancel"), "taker B got: {}", cancel_b.line);
+
+    shutdown.cancel();
+}
+
+// ── Handshake edge-case tests ───────────────────────────────────────────
 
 const NICK_EDGE: &str = "J5edgeCaseOOOOOO"; // 16 chars
 

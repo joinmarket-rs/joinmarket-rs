@@ -260,6 +260,17 @@ pub enum MessageCommand {
     Fill, IoAuth, Auth, PubKey, Tx, Sig, Push, Error,
 }
 
+impl MessageCommand {
+    /// Returns `true` for commands that should be routed to the takers-only
+    /// broadcast channel: all offer-type commands, `!cancel`, and `!tbond`.
+    /// Returns `false` for commands that must reach makers as well (`!orderbook`,
+    /// `!hp2`) and for all private-message commands.
+    pub fn is_taker_only(&self) -> bool;
+
+    /// Returns `true` for the six offer-announcement variants.
+    pub fn is_offer(&self) -> bool;
+}
+
 pub struct JmMessage {
     pub command: MessageCommand,
     pub fields: Vec<String>,
@@ -520,6 +531,8 @@ pub struct PeerContext {
 
 **Peer classification rule:** A peer is a Maker if its handshake `location-string` is non-empty AND passes `OnionServiceAddr::parse()`. A peer whose `location-string` is empty is a Taker. A peer whose `location-string` is non-empty but fails validation is **disconnected immediately** — it is neither registered as a Maker nor a Taker.
 
+**Onion ownership is not verified:** `OnionServiceAddr::parse()` validates only the *format* of the claimed address (base32 encoding, SHA3-256 checksum, version byte `0x03`). It does not verify that the connecting peer controls the claimed onion. A peer may supply any syntactically valid address and be classified as a Maker; however, takers who later try to connect directly to that address will reach whoever actually runs it — not the claimer — so coinjoin completion is impossible without genuine ownership. This is a protocol-level limitation shared by Python JoinMarket; fixing it would require a circuit-binding ownership proof (signing a DN challenge with the onion's Ed25519 private key over the Tor circuit).
+
 **Message framing:** Messages are `\n`-terminated strings. Maximum line length: 40,000 bytes (matching Python JoinMarket's `MAX_LENGTH`). Lines are read via a bounded `read_line_bounded()` helper that prevents OOM by rejecting lines before allocating beyond the limit. Peers that exceed this are disconnected.
 
 **From-nick validation:** For both pubmsg and privmsg, the `from_nick` extracted from the message line is verified against the peer's authenticated nick. Mismatches cause immediate disconnect to prevent nick spoofing.
@@ -545,12 +558,13 @@ pub struct BroadcastMsg {
 }
 
 pub struct Router {
-    makers: ShardedRegistry<MakerInfo>,       // nick → MakerInfo
-    takers: ShardedRegistry<TakerInfo>,       // nick → TakerInfo (not exposed via GETPEERLIST)
-    broadcast_tx: broadcast::Sender<BroadcastMsg>,
-    peer_meta: DashMap<Arc<str>, PeerMeta>,   // per-peer metadata
-    dn_nick: Mutex<String>,                   // directory node's own nick
-    dn_location: Mutex<String>,               // directory node's onion location
+    makers: ShardedRegistry<MakerInfo>,            // nick → MakerInfo
+    takers: ShardedRegistry<TakerInfo>,            // nick → TakerInfo (not exposed via GETPEERLIST)
+    broadcast_tx: broadcast::Sender<BroadcastMsg>, // all-peers channel
+    broadcast_tx_takers: broadcast::Sender<BroadcastMsg>, // takers-only channel
+    peer_meta: DashMap<Arc<str>, PeerMeta>,        // per-peer metadata
+    dn_nick: Mutex<String>,                        // directory node's own nick
+    dn_location: Mutex<String>,                    // directory node's onion location
 }
 
 pub struct MakerInfo {
@@ -578,10 +592,18 @@ impl Router {
     // Searches makers first, then falls back to takers.
     pub fn locate_peer(&self, nick: &str) -> Option<String>;
 
-    // Broadcast public message to all connected peers except sender
+    // Broadcast to all connected peers (makers + takers) except sender.
+    // Used for !orderbook, !hp2, and disconnect notifications.
     pub fn broadcast(&self, sender_nick: &str, msg: Arc<str>);
-    // Broadcast system messages (empty sender_nick, e.g., disconnect notifications)
+    // Broadcast to takers only (makers never subscribe to this channel).
+    // Used for offer announcements, !cancel, and !tbond.
+    pub fn broadcast_to_takers(&self, sender_nick: &str, msg: Arc<str>);
+    // Broadcast a system message with no sender echo filter (e.g., disconnect notifications).
     pub fn broadcast_raw(&self, msg: Arc<str>);
+    // Subscribe to the all-peers channel (called by both maker and taker tasks).
+    pub fn subscribe(&self) -> broadcast::Receiver<BroadcastMsg>;
+    // Subscribe to the takers-only channel (called by taker tasks only).
+    pub fn subscribe_takers(&self) -> broadcast::Receiver<BroadcastMsg>;
 }
 
 pub struct PeersResponse {
@@ -595,7 +617,18 @@ pub struct PeersResponse {
 
 **ShardedRegistry:** 64 shards, keyed by a hash of the full nick string modulo 64 (using `DefaultHasher`). Each shard is a `parking_lot::Mutex<HashMap<Arc<str>, PeerInfo>>`. This avoids a single global lock hot-spot at high peer counts and ensures even distribution across shards regardless of nick prefix patterns.
 
-**Broadcast channel:** Use `tokio::sync::broadcast::channel` with capacity 1024. All connected peer tasks hold a `Receiver`. When a peer lags (falls behind by >1024 messages), it receives `RecvError::Lagged` and is disconnected.
+**Broadcast channels:** Two separate `tokio::sync::broadcast` channels with independent capacities:
+
+| Channel | Capacity | Subscribers | Carries |
+|---|---|---|---|
+| `broadcast_tx` (all-peers) | 256 | Makers + Takers | `!orderbook`, `!hp2`, disconnect notifications |
+| `broadcast_tx_takers` (takers-only) | 256 | Takers only | Offer announcements, `!cancel`, `!tbond` |
+
+Offer commands, `!cancel`, and `!tbond` are routed to the takers-only channel because makers have no use for other makers' offer information. In the JoinMarket protocol a maker's response to `!orderbook` is sent as a PRIVMSG directly to the requesting taker's nick and never touches the broadcast channel; offer PUBMSGs arise only from maker startup/reconnect announcements and offer-list updates, both low-frequency events. Routing them to a separate channel eliminates unnecessary traffic to maker tasks without changing any wire-level behaviour.
+
+Maker peer tasks subscribe only to `broadcast_tx`. Taker peer tasks subscribe to both. For maker tasks the `recv_taker_bcast()` helper returns `std::future::pending` (never resolves), so the taker select arm is present in the loop at zero cost.
+
+Both rings are sized at 256 slots, matching the low-frequency nature of the traffic each carries. When a peer falls behind by more than the ring capacity on either channel, it receives `RecvError::Lagged` and is disconnected; the metric `jm_broadcast_lag_evictions_total{channel="all|takers"}` tracks each channel separately.
 
 ### `admission.rs` — Multi-Layer Defence
 
@@ -715,8 +748,6 @@ jm_peers_total_registered{role="maker|taker"} counter
 jm_handshakes_total{result="ok|eof|error|timeout|parse_error|proto_mismatch|network_mismatch"}  counter
 
 # Message routing
-jm_messages_broadcast_total                 counter
-jm_broadcast_lag_evictions_total            counter  # peers dropped for lagging
 jm_router_locate_duration_seconds           histogram
 jm_router_locate_hits_total                 counter
 jm_router_locate_misses_total              counter
@@ -732,6 +763,10 @@ jm_admission_maker_cap_rejections_total    counter  # Layer 4
 
 # Heartbeat
 jm_heartbeat_evictions_total               counter
+
+# Broadcast channels (label distinguishes all-peers vs takers-only)
+jm_messages_broadcast_total{channel="all|takers"}         counter
+jm_broadcast_lag_evictions_total{channel="all|takers"}    counter
 ```
 
 ---
@@ -744,7 +779,9 @@ jm_heartbeat_evictions_total               counter
 1. Validate `from_nick` matches the peer's authenticated nick (disconnect on mismatch)
 1. Enforce per-peer rate limit (30 pubmsg per 60-second window)
 1. If sender is a Maker and the message is an offer command, update `last_ann` in `MakerInfo`
-1. `router.broadcast(sender_nick, msg)` — fans out via broadcast channel to all peers
+1. Route to the correct broadcast channel based on `command.is_taker_only()`:
+   - **`true`** (offer announcements, `!cancel`, `!tbond`) → `router.broadcast_to_takers()` — taker peer tasks only; maker tasks never receive these
+   - **`false`** (`!orderbook`, `!hp2`) → `router.broadcast()` — all connected peers (makers and takers must both receive these)
 
 ### Private message routing (`!fill`, `!ioauth`, etc.)
 

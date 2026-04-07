@@ -245,7 +245,7 @@ envelope-level message types (integer discriminators), not `!`-prefixed JoinMark
 - Use **`Arc<str>`** not `String` for nicks and broadcast payloads stored in the registry.
 - Use **`ShardedRegistry<T>`** (64 `parking_lot::Mutex<HashMap<Arc<str>, T>>` shards) for maker/taker registries. Each registry holds its own `RandomState` seeded at construction; `shard_for` takes `&self` and uses `BuildHasher::hash_one()`. **Never use `DefaultHasher::new()`** — it is deterministic and allows an attacker to craft nicks that all land on one shard.
 - Use **`DashMap<Arc<str>, PeerMeta>`** for peer metadata.
-- Broadcast channel capacity: **1024**. Peers that lag are disconnected with `RecvError::Lagged`.
+- Broadcast channel capacity: **256**. Peers that lag are disconnected with `RecvError::Lagged`.
 
 ### Tor Backend Feature Flags
 
@@ -319,17 +319,17 @@ cargo semver-checks -p joinmarket-core --baseline-rev v0.1.0-alpha
 - **Arti-only advisories** are suppressed in `deny.toml` with documented reasons. Do not
   remove those entries without confirming the upstream fix is available.
 
-### Nick signature protocol (`nick-sig` handshake field)
+### Nick signature protocol (`nick-sig`)
 
-- `PeerHandshake` has an optional `"nick-sig"` JSON field (base64 recoverable ECDSA, 65 bytes).
-- If present, it is verified in `PeerHandshake::validate()` via `Nick::verify_signature()`:
-  - **Message**: the nick string as bytes (`nick.as_bytes()`)
-  - **Channel ID**: `"onion-network"` (matches Python JoinMarket `hostid` in `onionmc.py`)
-  - **Hash**: `sha256(channel_id || message)`
-- If present but invalid → `HandshakeError::NickSigInvalid` → silent disconnect + `jm_invalid_nick_sig_total` counter.
-- If absent → accepted (lenient mode — no Python client sends this yet) + `jm_missing_nick_sig_total` counter.
-- To flip to strict mode when Python clients are updated: return `HandshakeError::NickSigInvalid` when `nick_sig.is_none()`.
-- The channel ID constant is `NICK_SIG_CHANNEL_ID` in `handshake.rs`.
+Nick-sig handshake validation was implemented and then removed (commit `bfd69f9`).
+The `NickSig` / `SigningKey` / `Nick::verify_signature()` API remains in
+`joinmarket-core/src/nick.rs` for future use. Key facts if re-implementing:
+
+- Message to sign: the nick string as bytes (`nick.as_bytes()`)
+- Channel ID: `"onion-network"` (matches Python JoinMarket `hostid` in `onionmc.py`)
+- Hash: `sha256(channel_id || message)`
+- No Python client currently sends a `nick-sig` in the handshake — any
+  implementation must default to lenient mode (absent = accepted) at first.
 
 ### `secp256k1` version notes
 

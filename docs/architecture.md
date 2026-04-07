@@ -268,7 +268,7 @@ impl MessageCommand {
 pub struct JmMessage {
     pub command: MessageCommand,
     pub fields: Vec<String>,
-    pub nick_sig: Option<NickSig>,
+    pub nick_sig: Option<RawNickSig>,
 }
 
 impl JmMessage {

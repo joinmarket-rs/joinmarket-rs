@@ -28,7 +28,7 @@ pub async fn heartbeat_loop(router: Arc<Router>, shutdown: CancellationToken) {
                 let takers = router.taker_count();
                 tracing::debug!(makers, takers, "Heartbeat: idle sweep");
 
-                // Step 1: Hard-evict peers idle > 15 min (no probe, just disconnect).
+                // Step 1: Hard-evict peers idle > 25 min (no probe, just disconnect).
                 let hard_evicted = router.collect_idle_peers(
                     Duration::from_secs(HARD_EVICT_THRESHOLD_SECS)
                 );
@@ -37,16 +37,16 @@ pub async fn heartbeat_loop(router: Arc<Router>, shutdown: CancellationToken) {
                     metrics::counter!("jm_heartbeat_evictions_total")
                         .increment(hard_evicted.len() as u64);
                     for nick in &hard_evicted {
-                        tracing::debug!(%nick, "Hard evicted (idle > 15 min)");
+                        tracing::debug!(%nick, "Hard evicted (idle > 25 min)");
                     }
                 }
 
-                // Step 2: Probe idle peers (> 5 min) based on their capabilities:
+                // Step 2: Probe idle peers (> 10 min) based on their capabilities:
                 //   - Ping-capable peers: send !ping and wait for !pong.
                 //   - Non-ping makers (Python clients): send a unicast !orderbook so
                 //     the maker re-announces its offers. When the DN receives those
                 //     offer pubmsgs it updates last_seen, keeping the maker alive.
-                //   - Non-ping takers: no probe. Hard-evicted at 15 min if silent.
+                //   - Non-ping takers: no probe. Hard-evicted at 25 min if silent.
                 let peers_to_probe = router.collect_peers_for_probe(
                     Duration::from_secs(WRITE_PROBE_THRESHOLD_SECS)
                 );
@@ -56,8 +56,13 @@ pub async fn heartbeat_loop(router: Arc<Router>, shutdown: CancellationToken) {
                 }
 
                 let ping_frame = build_ping_frame();
-                let dn_nick = router.dn_nick();
-                let orderbook_frame = build_orderbook_probe_frame(&dn_nick);
+                // Build the !orderbook probe only when the DN identity is set.
+                // If `set_identity` hasn't been called yet (shouldn't happen
+                // given the 60-second initial delay, but defended here), an
+                // orderbook probe with an empty nick would be a malformed frame.
+                let orderbook_frame: Option<Arc<str>> = router
+                    .dn_nick()
+                    .map(|n| build_orderbook_probe_frame(&n));
                 let mut ping_sent = false;
 
                 for (nick, supports_ping, is_maker) in &peers_to_probe {
@@ -71,12 +76,15 @@ pub async fn heartbeat_loop(router: Arc<Router>, shutdown: CancellationToken) {
                     } else if *is_maker {
                         // Non-ping maker: unicast !orderbook to elicit an offer
                         // re-announcement, which will refresh last_seen when received.
-                        if router.send_to_peer(nick, orderbook_frame.clone()) {
-                            metrics::counter!("jm_heartbeat_orderbook_probes_total").increment(1);
-                            tracing::debug!(%nick, "Sent !orderbook probe to non-ping maker");
+                        // Skipped if DN identity isn't set yet (orderbook_frame is None).
+                        if let Some(ref frame) = orderbook_frame {
+                            if router.send_to_peer(nick, frame.clone()) {
+                                metrics::counter!("jm_heartbeat_orderbook_probes_total").increment(1);
+                                tracing::debug!(%nick, "Sent !orderbook probe to non-ping maker");
+                            }
                         }
                     }
-                    // Non-ping takers: no probe. Hard-evicted at 15 min if silent.
+                    // Non-ping takers: no probe. Hard-evicted at 25 min if silent.
                 }
 
                 // Step 3: If !pings were sent, wait then evict non-responders.

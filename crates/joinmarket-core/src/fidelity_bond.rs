@@ -1,5 +1,30 @@
 use base64::Engine;
 
+/// A parsed fidelity bond proof as transmitted in the handshake `features` map.
+///
+/// # Signature verification — intentionally not performed by the directory node
+///
+/// A complete bond proof contains two signatures (`nick_sig`, `cert_sig`) that
+/// could be verified in-band without blockchain access.  The directory node
+/// deliberately does **not** verify them for the following reasons:
+///
+/// 1. **Division of responsibility** — The DN is a routing layer, not a trust
+///    authority.  Takers are responsible for validating bond proofs (including
+///    on-chain UTXO existence and value) before selecting makers.  Duplicating
+///    that logic here would couple the DN to the Bitcoin signing protocol.
+///
+/// 2. **No blockchain access** — Full bond validation requires confirming that
+///    the claimed UTXO exists on-chain and has the correct value and timelock.
+///    The DN runs without a Bitcoin node by design.
+///
+/// 3. **The DN's bond role is narrow** — The only bond-related enforcement the
+///    DN performs is UTXO uniqueness (via `FidelityBondRegistry`): two makers
+///    cannot claim the same UTXO simultaneously.  This prevents one maker from
+///    borrowing another's bond to inflate their apparent reputation with the DN,
+///    even though it does not prove the bond is cryptographically valid.
+///
+/// Do **not** add signature verification here without first re-evaluating the
+/// DN's no-blockchain design constraint.
 #[derive(Debug, Clone)]
 pub struct FidelityBondProof {
     pub nick_sig:    [u8; 72],

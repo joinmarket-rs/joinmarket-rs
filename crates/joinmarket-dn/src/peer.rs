@@ -40,13 +40,28 @@ struct RateLimitState {
 async fn read_line_bounded(
     reader: &mut BufReader<BoxReader>,
     buf: &mut String,
+    raw: &mut Vec<u8>,
     max_len: usize,
 ) -> std::io::Result<usize> {
     buf.clear();
+    raw.clear();
+    // Accumulate raw bytes before converting to UTF-8.  Converting each
+    // `fill_buf` chunk individually would reject valid multi-byte sequences
+    // that happen to be split across two consecutive `fill_buf` windows
+    // (e.g. a 3-byte character returned as 2 bytes then 1 byte).  Deferring
+    // the conversion until the newline is found (or EOF) avoids that.
+    // The caller owns `raw` and reuses it across calls so no allocation
+    // occurs on the hot path once the buffer has reached its working size.
     let mut total = 0usize;
     loop {
         let available = reader.fill_buf().await?;
         if available.is_empty() {
+            // EOF — convert and flush whatever was accumulated
+            if !raw.is_empty() {
+                let s = std::str::from_utf8(raw)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                buf.push_str(s);
+            }
             return Ok(total);
         }
         let newline_pos = available.iter().position(|&b| b == b'\n');
@@ -59,11 +74,12 @@ async fn read_line_bounded(
                 "line exceeds maximum length",
             ));
         }
-        let chunk = std::str::from_utf8(&available[..end])
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        buf.push_str(chunk);
+        raw.extend_from_slice(&available[..end]);
         reader.consume(end);
         if newline_pos.is_some() {
+            let s = std::str::from_utf8(raw)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            buf.push_str(s);
             return Ok(total);
         }
     }
@@ -116,11 +132,16 @@ pub async fn handle_peer(
     let mut reader = BufReader::with_capacity(4096, reader);
     let mut writer = BufWriter::with_capacity(4096, writer);
 
-    // Step 1: Read peer's handshake — peer sends FIRST (type=793)
+    // Single line/byte buffers reused for the handshake read and every
+    // subsequent message-loop read. Declaring them here avoids two separate
+    // Vec allocations and makes the reuse intent explicit.
     let mut line = String::new();
+    let mut raw_buf: Vec<u8> = Vec::new();
+
+    // Step 1: Read peer's handshake — peer sends FIRST (type=793)
     let handshake_result = tokio::time::timeout(
         Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
-        read_line_bounded(&mut reader, &mut line, MAX_LINE_LEN),
+        read_line_bounded(&mut reader, &mut line, &mut raw_buf, MAX_LINE_LEN),
     ).await;
 
     match handshake_result {
@@ -235,17 +256,20 @@ pub async fn handle_peer(
     let is_maker = peer_role == PeerRole::Maker;
     let bond = peer_handshake.fidelity_bond();
 
-    // Admission control (layers 2, 3, 4) — only for makers (who have an onion addr)
-    if let Some(ref onion) = peer_onion {
-        if let Err(e) = admission.admit_peer(nick.as_ref(), onion, bond.as_ref()) {
-            tracing::warn!(nick = %nick, error = %e, "Admission rejected");
-            return;
-        }
+    // Admission control — all peers run layers 1 and 4 (nick uniqueness + capacity);
+    // makers additionally run layers 2 and 3 (sybil guard + bond deduplication).
+    if let Err(e) = admission.admit_peer(nick.as_ref(), peer_onion.as_ref(), bond.as_ref()) {
+        tracing::warn!(nick = %nick, error = %e, "Admission rejected");
+        return;
     }
 
     // Step 2: Send directory's handshake response (type=795) — accepted
     if send_dn_handshake(&mut writer, directory_nick, nick.as_ref(), directory_onion, network, motd, true).await.is_err() {
         tracing::warn!(nick = %nick, "Failed to send DN handshake");
+        // Roll back admission: the peer never received the accepted response so
+        // it will not try to reconnect as a live session, but its nick slot and
+        // capacity counter must be freed so a future reconnect can succeed.
+        admission.release_peer(nick.as_ref(), is_maker);
         return;
     }
 
@@ -292,13 +316,12 @@ pub async fn handle_peer(
         orderbook_timestamps: std::collections::VecDeque::new(),
     };
 
-    // Message loop
-    let mut line = String::new();
+    // Message loop — `line` and `raw_buf` are reused from above.
     loop {
         line.clear();
 
         tokio::select! {
-            result = read_line_bounded(&mut reader, &mut line, MAX_LINE_LEN) => {
+            result = read_line_bounded(&mut reader, &mut line, &mut raw_buf, MAX_LINE_LEN) => {
                 match result {
                     Ok(0) => {
                         tracing::debug!(nick = %nick, "Peer disconnected");
@@ -377,11 +400,9 @@ pub async fn handle_peer(
 
     // Broadcast disconnect notification before deregistering
     if let Some(loc) = router.locate_peer(nick.as_ref()) {
-        let dn_nick = router.dn_nick();
-        let dn_loc = router.dn_location();
         let disconnect_entry = format!("{};{};D", nick, loc);
         let mut body = disconnect_entry;
-        if !dn_nick.is_empty() && !dn_loc.is_empty() {
+        if let Some((dn_nick, dn_loc)) = router.dn_identity_pair() {
             body.push(',');
             body.push_str(&format!("{};{}", dn_nick, dn_loc));
         }
@@ -389,18 +410,16 @@ pub async fn handle_peer(
         router.broadcast_raw(Arc::from(env.serialize().as_str()));
     }
 
-    // Cleanup
+    // Cleanup — release_peer is always called because admit_peer is now always called.
     router.deregister(nick.as_ref());
-    if peer_onion.is_some() {
-        admission.release_peer(nick.as_ref());
-    }
+    admission.release_peer(nick.as_ref(), is_maker);
 
     tracing::info!(nick = %nick, "Peer disconnected and deregistered");
 }
 
 /// Send the directory's type=795 handshake response.
 /// `dir_onion` is the bare onion address (without port); the location-string is
-/// formatted as `<onion>:5222` to match the JoinMarket default port.
+/// formatted as `<onion>:<VIRTUAL_PORT>` to match the JoinMarket default port.
 async fn send_dn_handshake(
     writer: &mut BufWriter<BoxWriter>,
     dir_nick: &str,
@@ -413,7 +432,7 @@ async fn send_dn_handshake(
     let dn_hs = DnHandshake {
         app_name: "joinmarket".to_string(),
         directory: true,
-        location_string: format!("{}:5222", dir_onion),
+        location_string: format!("{}:{}", dir_onion, crate::VIRTUAL_PORT),
         proto_ver_min: CURRENT_PROTO_VER,
         proto_ver_max: CURRENT_PROTO_VER,
         features: HashMap::new(),
@@ -509,7 +528,7 @@ async fn handle_message(
                 }
 
                 if parsed_msg.is_some() {
-                    dispatch_pubmsg(body, nick.clone(), router, writer).await?;
+                    broadcast_pubmsg(&nick, body, router);
                 }
             } else {
                 tracing::debug!(nick = %nick, "Ignoring malformed pubmsg line");
@@ -536,9 +555,7 @@ async fn handle_message(
             let response = router.get_peers_response();
             let mut entries: Vec<String> = Vec::with_capacity(response.peers.len() + 1);
             // Include DN itself (Python DN always includes itself in the peerlist)
-            let dn_nick = router.dn_nick();
-            let dn_loc = router.dn_location();
-            if !dn_nick.is_empty() && !dn_loc.is_empty() {
+            if let Some((dn_nick, dn_loc)) = router.dn_identity_pair() {
                 entries.push(format!("{};{}", dn_nick, dn_loc));
             }
             for maker in &response.peers {
@@ -571,16 +588,6 @@ async fn handle_message(
     Ok(())
 }
 
-async fn dispatch_pubmsg(
-    body: &str,
-    nick: Arc<str>,
-    router: &Router,
-    _writer: &mut BufWriter<BoxWriter>,
-) -> anyhow::Result<()> {
-    broadcast_pubmsg(&nick, body, router);
-    Ok(())
-}
-
 /// Serialise and broadcast a public message to all connected peers.
 fn broadcast_pubmsg(nick: &Arc<str>, body: &str, router: &Router) {
     let pubmsg_line = format!("{}!PUBLIC{}", nick, body);
@@ -604,7 +611,7 @@ async fn dispatch_privmsg(
     if !router.send_to_peer(to_nick, fwd_bytes) {
         // Don't count messages directed at the DN's own nick as routing misses;
         // these are expected privmsg replies to heartbeat !orderbook probes.
-        if to_nick != router.dn_nick() {
+        if router.dn_nick().is_none_or(|n| n.as_ref() != to_nick) {
             metrics::counter!("jm_router_locate_misses_total").increment(1);
             tracing::debug!(
                 from = %from_nick,
@@ -619,12 +626,10 @@ async fn dispatch_privmsg(
     // 2. Send a peerlist (type=789) with the sender's location to the target,
     //    so they can connect directly. Include the DN itself.
     if let Some(ref onion) = from_onion {
-        let dn_nick = router.dn_nick();
-        let dn_loc = router.dn_location();
         let mut entries = vec![
             format!("{};{}", from_nick, onion.as_location_string()),
         ];
-        if !dn_nick.is_empty() && !dn_loc.is_empty() {
+        if let Some((dn_nick, dn_loc)) = router.dn_identity_pair() {
             entries.push(format!("{};{}", dn_nick, dn_loc));
         }
         let peerlist_env = OnionEnvelope::new(msg_type::PEERLIST, entries.join(","));

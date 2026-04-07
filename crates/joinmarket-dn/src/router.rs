@@ -112,10 +112,11 @@ pub struct Router {
     broadcast_tx: broadcast::Sender<BroadcastMsg>,
     /// Consolidated per-peer metadata (shutdown token, probe channel, ping support, last_seen, pong_pending).
     peer_meta: DashMap<Arc<str>, PeerMeta>,
-    /// Directory node's own nick (set after Tor bootstrap).
-    dn_nick: Mutex<String>,
-    /// Directory node's own location-string, e.g. "xxxx.onion:5222".
-    dn_location: Mutex<String>,
+    /// Directory node identity — set exactly once after Tor bootstrap via
+    /// `set_identity`. `OnceLock` gives lock-free reads after initialisation
+    /// and makes the "set once" contract explicit: any code that observes
+    /// `None` knows the DN has not finished bootstrapping yet.
+    dn_identity: std::sync::OnceLock<(Arc<str>, Arc<str>)>,
 }
 
 impl Default for Router {
@@ -132,8 +133,7 @@ impl Router {
             takers: ShardedRegistry::new(),
             broadcast_tx,
             peer_meta: DashMap::new(),
-            dn_nick: Mutex::new(String::new()),
-            dn_location: Mutex::new(String::new()),
+            dn_identity: std::sync::OnceLock::new(),
         }
     }
 
@@ -142,20 +142,30 @@ impl Router {
         self.broadcast_tx.subscribe()
     }
 
-    /// Set the directory node's own identity (called once after Tor bootstrap).
+    /// Set the directory node's own identity. Must be called exactly once
+    /// after Tor bootstrap completes, before the accept loop starts.
     pub fn set_identity(&self, nick: String, location: String) {
-        *self.dn_nick.lock() = nick;
-        *self.dn_location.lock() = location;
+        let pair = (Arc::from(nick.as_str()), Arc::from(location.as_str()));
+        if self.dn_identity.set(pair).is_err() {
+            tracing::warn!("set_identity called more than once; second call ignored");
+        }
     }
 
-    /// Get the directory node's nick.
-    pub fn dn_nick(&self) -> String {
-        self.dn_nick.lock().clone()
+    /// Returns the directory node's nick, or `None` before `set_identity` is called.
+    pub fn dn_nick(&self) -> Option<Arc<str>> {
+        self.dn_identity.get().map(|(n, _)| n.clone())
     }
 
-    /// Get the directory node's location-string (e.g. "xxxx.onion:5222").
-    pub fn dn_location(&self) -> String {
-        self.dn_location.lock().clone()
+    /// Returns the directory node's location-string, or `None` before `set_identity`.
+    pub fn dn_location(&self) -> Option<Arc<str>> {
+        self.dn_identity.get().map(|(_, l)| l.clone())
+    }
+
+    /// Returns `(nick, location)` as a pair once identity is set, or `None`
+    /// before `set_identity` is called. Use this at call sites that need both
+    /// to avoid two separate lock-free reads.
+    pub fn dn_identity_pair(&self) -> Option<(Arc<str>, Arc<str>)> {
+        self.dn_identity.get().map(|(n, l)| (n.clone(), l.clone()))
     }
 
     /// Send a message to a specific peer via its dedicated write channel.
@@ -258,18 +268,26 @@ impl Router {
 
     /// Cancel shutdown tokens for all peers still awaiting a pong (they timed out),
     /// and return the list for logging/metrics.
+    ///
+    /// Uses `DashMap::retain` so the `pong_pending` check and the removal happen
+    /// while holding the shard write lock.  `record_pong` also acquires that lock
+    /// via `get_mut`, so the two operations are mutually exclusive per shard:
+    /// a peer that calls `record_pong` concurrently either completes it before
+    /// `retain` visits its shard (and is kept) or after (and is already removed).
+    /// The previous two-phase approach (iterate-then-remove) had a window between
+    /// the phases where a valid pong could arrive after the snapshot but before
+    /// the removal, causing a healthy peer to be wrongly evicted.
     pub fn collect_pong_timeouts(&self) -> Vec<Arc<str>> {
         let mut timed_out = Vec::new();
-        for entry in self.peer_meta.iter() {
-            if entry.value().pong_pending {
-                timed_out.push(entry.key().clone());
-            }
-        }
-        for nick in &timed_out {
-            if let Some((_, meta)) = self.peer_meta.remove(nick.as_ref()) {
+        self.peer_meta.retain(|nick, meta| {
+            if meta.pong_pending {
                 meta.shutdown.cancel();
+                timed_out.push(nick.clone());
+                false  // remove from map
+            } else {
+                true   // keep
             }
-        }
+        });
         timed_out
     }
 
@@ -501,6 +519,94 @@ mod tests {
 
         let frame: Arc<str> = "probe".into();
         assert!(!router.send_to_peer("J5testNickOOOOOO", frame));
+    }
+
+    /// Regression test for the two-phase TOCTOU race in `collect_pong_timeouts`.
+    ///
+    /// Simulates the scenario where `record_pong` is called after the old
+    /// Phase 1 snapshot but before Phase 2 removal.  With the `retain`-based
+    /// fix the check and removal are atomic per shard, so a peer that clears
+    /// `pong_pending` before `retain` visits its entry must be kept alive.
+    #[test]
+    fn test_pong_received_before_timeout_collection_keeps_peer() {
+        let router = Router::new();
+        let nick: Arc<str> = "J5testNickOOOOOO".into();
+        let token = CancellationToken::new();
+        let (tx, _rx) = mpsc::channel::<Arc<str>>(16);
+
+        router.peer_meta.insert(nick.clone(), PeerMeta {
+            shutdown: token.clone(),
+            probe_tx: tx,
+            supports_ping: true,
+            is_maker: false,
+            last_seen: Instant::now(),
+            pong_pending: true,  // ping was sent, awaiting pong
+        });
+
+        // Peer responds with pong before collect_pong_timeouts runs
+        router.record_pong("J5testNickOOOOOO");
+        assert!(!router.peer_meta.get("J5testNickOOOOOO").unwrap().pong_pending);
+
+        // collect_pong_timeouts must NOT evict this peer
+        let timed_out = router.collect_pong_timeouts();
+        assert!(timed_out.is_empty(), "peer that ponged should not be evicted");
+        assert!(!token.is_cancelled(), "shutdown token must not be cancelled");
+        assert!(router.peer_meta.contains_key("J5testNickOOOOOO"), "peer must remain in map");
+    }
+
+    #[test]
+    fn test_pong_timeout_evicts_non_responding_peer() {
+        let router = Router::new();
+        let nick: Arc<str> = "J5testNickOOOOOO".into();
+        let token = CancellationToken::new();
+        let (tx, _rx) = mpsc::channel::<Arc<str>>(16);
+
+        router.peer_meta.insert(nick.clone(), PeerMeta {
+            shutdown: token.clone(),
+            probe_tx: tx,
+            supports_ping: true,
+            is_maker: false,
+            last_seen: Instant::now(),
+            pong_pending: true,  // ping was sent, no pong received
+        });
+
+        // No record_pong call — peer never responded
+        let timed_out = router.collect_pong_timeouts();
+        assert_eq!(timed_out.len(), 1);
+        assert_eq!(timed_out[0].as_ref(), "J5testNickOOOOOO");
+        assert!(token.is_cancelled(), "non-responding peer must be evicted");
+        assert!(!router.peer_meta.contains_key("J5testNickOOOOOO"), "peer must be removed from map");
+    }
+
+    #[test]
+    fn test_dn_identity_none_before_set() {
+        let router = Router::new();
+        assert!(router.dn_nick().is_none(), "dn_nick should be None before set_identity");
+        assert!(router.dn_location().is_none());
+        assert!(router.dn_identity_pair().is_none());
+    }
+
+    #[test]
+    fn test_dn_identity_some_after_set() {
+        let router = Router::new();
+        router.set_identity(
+            "J5testDirNickOOO".to_string(),
+            "2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion:5222".to_string(),
+        );
+        assert_eq!(router.dn_nick().as_deref(), Some("J5testDirNickOOO"));
+        assert!(router.dn_location().is_some());
+        let (nick, loc) = router.dn_identity_pair().unwrap();
+        assert_eq!(nick.as_ref(), "J5testDirNickOOO");
+        assert!(loc.contains(":5222"));
+    }
+
+    #[test]
+    fn test_dn_identity_second_set_ignored() {
+        let router = Router::new();
+        router.set_identity("J5firstNickOOOOO".to_string(), "first.onion:5222".to_string());
+        router.set_identity("J5secondNickOOOO".to_string(), "second.onion:5222".to_string());
+        // First call wins; second is silently ignored
+        assert_eq!(router.dn_nick().as_deref(), Some("J5firstNickOOOOO"));
     }
 
     #[test]

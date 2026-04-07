@@ -1,5 +1,6 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+use configparser::ini::{Ini, IniDefault};
 
 use crate::onion::OnionServiceAddr;
 
@@ -469,35 +470,40 @@ impl DirectoryConfig {
     }
 
     pub fn parse(content: &str) -> Result<Self, ConfigError> {
-        // Parse INI format manually since the `ini` crate has a simple API
-        let mut sections: HashMap<String, HashMap<String, String>> = HashMap::new();
-        let mut current_section = String::new();
+        // Pre-process: strip lines whose first non-whitespace character is '#'
+        // or ';' (full-line comments).  This matches Python's ConfigParser
+        // default behaviour (comment_prefixes=('#',';')).
+        //
+        // Inline '#' / ';' inside a value are intentionally left untouched,
+        // also matching Python's default (inline_comment_prefixes=None).  This
+        // means a path like "hidden_service_dir = /home/user/#1/hs" is parsed
+        // correctly without being truncated at the '#'.
+        let preprocessed: String = content
+            .lines()
+            .map(|line| {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with('#') || trimmed.starts_with(';') { "" } else { line }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
 
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
-                continue;
-            }
-            if line.starts_with('[') && line.ends_with(']') {
-                current_section = line[1..line.len()-1].to_string();
-                sections.entry(current_section.clone()).or_default();
-            } else if let Some(eq_pos) = line.find('=') {
-                let key = line[..eq_pos].trim().to_string();
-                let raw_value = line[eq_pos+1..].trim().to_string();
-                // Strip inline comments preceded by whitespace (e.g. "value # comment")
-                let value = if let Some(pos) = raw_value.find(" #").or_else(|| raw_value.find(" ;")) {
-                    raw_value[..pos].trim_end().to_string()
-                } else {
-                    raw_value
-                };
-                sections.entry(current_section.clone())
-                    .or_default()
-                    .insert(key, value);
-            }
-        }
+        // Use the `configparser` crate (Python-compatible) with:
+        //   - no inline comment symbols (comment_symbols = []) so inline '#'
+        //     is preserved in values
+        //   - only '=' as a key-value delimiter (JoinMarket config never uses ':')
+        //   - case_sensitive = true to preserve 'MESSAGING:onion' section names
+        let mut defaults = IniDefault::default();
+        defaults.comment_symbols = vec![];
+        defaults.delimiters = vec!['='];
+        defaults.case_sensitive = true;
+        let mut ini = Ini::new_from_defaults(defaults);
+        ini.read(preprocessed).map_err(ConfigError::Parse)?;
 
+        // Returns Some(value) only when the key exists AND is non-empty.
+        // An empty value (e.g. "hidden_service_dir =") is treated as absent,
+        // consistent with how Python callers check `if config.get(...):`.
         let get_opt = |section: &str, key: &str| -> Option<String> {
-            sections.get(section).and_then(|s| s.get(key)).cloned()
+            ini.get(section, key).filter(|v| !v.is_empty())
         };
 
         let network = get_opt("BLOCKCHAIN", "network")
@@ -517,9 +523,9 @@ impl DirectoryConfig {
         let onion_serving_port = port_str.parse::<u16>()
             .map_err(|_| ConfigError::InvalidPort(port_str))?;
 
-        // Empty string means "not set" — treat same as absent
+        // Empty string means "not set" — treat same as absent.
+        // No extra `.filter` needed: `get_opt` already returns `None` for empty values.
         let hidden_service_dir = get_opt(&messaging_section, "hidden_service_dir")
-            .filter(|s| !s.is_empty())
             .map(|s| {
                 if s.starts_with('~') {
                     let home = std::env::var("HOME")
@@ -640,11 +646,25 @@ console_log_level = INFO
         assert!(!config.directory_nodes.is_empty());
     }
 
+    /// Full-line comments (lines starting with '#' or ';') must be stripped.
     #[test]
-    fn test_inline_comments_stripped() {
-        let config_str = "[BLOCKCHAIN]\nnetwork = mainnet # this is the main network\n";
+    fn test_full_line_comments_stripped() {
+        let config_str = "[BLOCKCHAIN]\n# full line comment\nnetwork = mainnet\n; semicolon comment\n";
         let config = DirectoryConfig::parse(config_str).unwrap();
         assert_eq!(config.network, "mainnet");
+    }
+
+    /// Inline '#' inside a value must be preserved — matches Python's
+    /// ConfigParser default (inline_comment_prefixes=None).  A path such as
+    /// "/home/user/#1/hs-keys" must not be silently truncated.
+    #[test]
+    fn test_inline_hash_preserved_in_values() {
+        let config_str = "[MESSAGING:onion]\nhidden_service_dir = /some/path #1/dir\n";
+        let config = DirectoryConfig::parse(config_str).unwrap();
+        assert_eq!(
+            config.hidden_service_dir.unwrap().to_str().unwrap(),
+            "/some/path #1/dir",
+        );
     }
 
     #[test]

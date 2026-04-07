@@ -8,3 +8,8 @@ pub mod sybil_guard;
 pub mod bond_registry;
 pub mod heartbeat;
 pub mod metrics;
+
+/// The standard JoinMarket directory node virtual port, used both when
+/// registering the hidden service and when advertising the DN's own
+/// location-string to peers.
+pub const VIRTUAL_PORT: u16 = 5222;

@@ -83,7 +83,7 @@ impl PeerHandshake {
                 got: self.network.clone(),
             });
         }
-        crate::nick::Nick::from_str(&self.nick)
+        crate::nick::Nick::from_str_for_network(&self.nick, expected_network)
             .map_err(|_| HandshakeError::MalformedNick)?;
         if !self.location_string.is_empty()
             && self.location_string != crate::message::NOT_SERVING_ONION
@@ -223,6 +223,16 @@ mod tests {
         );
         let msg = PeerHandshake::parse_json(&json).unwrap();
         assert!(msg.fidelity_bond().is_some());
+    }
+
+    #[test]
+    fn test_validate_wrong_nick_version_byte() {
+        // Nick with 'M' (testnet) version byte presented to a mainnet DN
+        let json = r#"{"app-name":"joinmarket","directory":false,"location-string":"","proto-ver":5,"features":{},"nick":"JMxhGSWE7VrxM7sO","network":"mainnet"}"#;
+        let msg = PeerHandshake::parse_json(json).unwrap();
+        let err = msg.validate("mainnet").unwrap_err();
+        assert!(matches!(err, HandshakeError::MalformedNick),
+            "expected MalformedNick for wrong version byte, got {:?}", err);
     }
 
     #[test]

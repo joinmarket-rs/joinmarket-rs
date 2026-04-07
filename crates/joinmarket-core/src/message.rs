@@ -100,14 +100,18 @@ pub enum MessageCommand {
     Error,
 }
 
+/// A raw base64 string extracted heuristically from the last field of a JM
+/// message. This is the unverified wire representation — it has not been
+/// decoded or validated as a secp256k1 signature. Use `nick::NickSig` for
+/// the verified crypto type.
 #[derive(Debug, Clone)]
-pub struct NickSig(pub String);
+pub struct RawNickSig(pub String);
 
 #[derive(Debug, Clone)]
 pub struct JmMessage {
     pub command: MessageCommand,
     pub fields: Vec<String>,
-    pub nick_sig: Option<NickSig>,
+    pub nick_sig: Option<RawNickSig>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -230,7 +234,7 @@ impl JmMessage {
 /// treat it as a nick signature.  This can misidentify a regular field that
 /// happens to be 88 chars of valid base64 decoding to 65 bytes, but in
 /// practice JoinMarket message fields never collide with this pattern.
-fn extract_nick_sig(mut fields: Vec<String>) -> (Vec<String>, Option<NickSig>) {
+fn extract_nick_sig(mut fields: Vec<String>) -> (Vec<String>, Option<RawNickSig>) {
     if let Some(last) = fields.last() {
         let len = last.len();
         if len == 88 || len == 87 {
@@ -239,8 +243,12 @@ fn extract_nick_sig(mut fields: Vec<String>) -> (Vec<String>, Option<NickSig>) {
                 .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(last));
             if let Ok(bytes) = decoded {
                 if bytes.len() == 65 {
-                    let sig_str = fields.pop().unwrap();
-                    return (fields, Some(NickSig(sig_str)));
+                    // fields.last() returned Some above, so pop() is guaranteed
+                    // to succeed. Using `if let` avoids an unwrap() in a
+                    // peer-data path, per project policy.
+                    if let Some(sig_str) = fields.pop() {
+                        return (fields, Some(RawNickSig(sig_str)));
+                    }
                 }
             }
         }

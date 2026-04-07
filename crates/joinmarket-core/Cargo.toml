@@ -17,6 +17,7 @@ serde_json = "1"
 thiserror = "1"
 rand = "0.8"
 base64 = "0.22"
+configparser = "3"
 
 [dev-dependencies]
 hex = "0.4"

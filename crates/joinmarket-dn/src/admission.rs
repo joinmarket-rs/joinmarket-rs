@@ -49,11 +49,22 @@ impl AdmissionController {
         }
     }
 
-    /// Layers 2, 3, 4: Admit peer after handshake
+    /// Admit a peer after a successful handshake.
+    ///
+    /// Runs up to four layers of admission checks:
+    ///
+    /// - **Layer 1 (all peers):** Nick uniqueness — prevents two connections
+    ///   from racing through the pipeline with the same nick simultaneously.
+    /// - **Layer 2 (makers only):** Sybil guard — one onion address per nick.
+    /// - **Layer 3 (makers with a bond):** Bond UTXO deduplication.
+    /// - **Layer 4 (all peers):** Global capacity cap (makers + takers combined).
+    ///
+    /// Pass `onion_addr: Some(addr)` for makers; `None` for takers.  Layers 2
+    /// and 3 are skipped when `onion_addr` is `None`.
     pub fn admit_peer(
         &self,
         nick: &str,
-        onion_addr: &OnionServiceAddr,
+        onion_addr: Option<&OnionServiceAddr>,
         bond: Option<&FidelityBondProof>,
     ) -> Result<(), AdmissionError> {
         // Layer 1: Nick uniqueness — atomically reserve the nick before any
@@ -68,20 +79,27 @@ impl AdmissionController {
             admitted.insert(nick.to_string());
         } // lock released before heavier checks
 
-        // Layer 2: Sybil guard
-        self.sybil_guard.register(nick, &onion_addr.host).map_err(|e| {
-            self.admitted_nicks.lock().remove(nick);
-            metrics::counter!("jm_admission_sybil_rejections_total").increment(1);
-            AdmissionError::Sybil(e)
-        })?;
-
-        // Layer 3: Bond deduplication (only for makers with bonds)
-        if let Some(b) = bond {
-            if let Err(e) = self.bond_registry.register_bond(nick, b) {
-                self.sybil_guard.deregister(nick);
+        // Layer 2: Sybil guard (makers only).
+        if let Some(onion) = onion_addr {
+            self.sybil_guard.register(nick, &onion.host).map_err(|e| {
                 self.admitted_nicks.lock().remove(nick);
-                metrics::counter!("jm_admission_bond_dup_rejections_total").increment(1);
-                return Err(AdmissionError::BondDuplicate(e));
+                metrics::counter!("jm_admission_sybil_rejections_total").increment(1);
+                AdmissionError::Sybil(e)
+            })?;
+
+            // Layer 3: Bond UTXO deduplication (makers with a bond only).
+            // NOTE: bond *signatures* (nick_sig, cert_sig) are intentionally
+            // not verified here.  Signature and on-chain validation is the
+            // taker's responsibility.  The DN only enforces that two makers
+            // cannot claim the same UTXO simultaneously.  See the doc-comment
+            // on `FidelityBondProof` for the full rationale.
+            if let Some(b) = bond {
+                if let Err(e) = self.bond_registry.register_bond(nick, b) {
+                    self.sybil_guard.deregister(nick);
+                    self.admitted_nicks.lock().remove(nick);
+                    metrics::counter!("jm_admission_bond_dup_rejections_total").increment(1);
+                    return Err(AdmissionError::BondDuplicate(e));
+                }
             }
         }
 
@@ -90,9 +108,11 @@ impl AdmissionController {
         let prev = self.peer_count.fetch_add(1, Ordering::AcqRel);
         if prev >= MAX_CONCURRENT_PEERS {
             self.peer_count.fetch_sub(1, Ordering::AcqRel);
-            self.sybil_guard.deregister(nick);
-            if bond.is_some() {
-                self.bond_registry.deregister_nick(nick);
+            if onion_addr.is_some() {
+                self.sybil_guard.deregister(nick);
+                if bond.is_some() {
+                    self.bond_registry.deregister_nick(nick);
+                }
             }
             self.admitted_nicks.lock().remove(nick);
             metrics::counter!("jm_admission_peer_cap_rejections_total").increment(1);
@@ -102,9 +122,16 @@ impl AdmissionController {
         Ok(())
     }
 
-    pub fn release_peer(&self, nick: &str) {
-        self.sybil_guard.deregister(nick);
-        self.bond_registry.deregister_nick(nick);
+    /// Release all resources reserved by `admit_peer`.
+    ///
+    /// `is_maker` must match the value that was passed to `admit_peer` so that
+    /// the sybil guard and bond registry (which are only written for makers)
+    /// are not spuriously locked on taker disconnect.
+    pub fn release_peer(&self, nick: &str, is_maker: bool) {
+        if is_maker {
+            self.sybil_guard.deregister(nick);
+            self.bond_registry.deregister_nick(nick);
+        }
         self.peer_count.fetch_sub(1, Ordering::AcqRel);
         self.admitted_nicks.lock().remove(nick);
     }
@@ -131,18 +158,44 @@ mod tests {
     fn test_admit_maker_increments_peer_count() {
         let ac = AdmissionController::new();
         let onion = make_onion_addr();
-        assert!(ac.admit_peer("J5nickAAAAAAAA0", &onion, None).is_ok());
+        assert!(ac.admit_peer("J5nickAAAAAAAA0", Some(&onion), None).is_ok());
         assert_eq!(ac.peer_count.load(Ordering::Acquire), 1);
     }
 
     #[test]
-    fn test_duplicate_nick_rejected() {
+    fn test_admit_taker_increments_peer_count() {
+        let ac = AdmissionController::new();
+        assert!(ac.admit_peer("J5nickAAAAAAAA0", None, None).is_ok());
+        assert_eq!(ac.peer_count.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn test_duplicate_nick_rejected_maker_vs_maker() {
         let ac = AdmissionController::new();
         let onion = make_onion_addr();
-        ac.admit_peer("J5nickAAAAAAAA0", &onion, None).unwrap();
-        // Second admission with same nick must fail even from a different onion
+        ac.admit_peer("J5nickAAAAAAAA0", Some(&onion), None).unwrap();
+        // Same nick from a different onion must fail
         let onion2 = make_onion_addr2();
-        let err = ac.admit_peer("J5nickAAAAAAAA0", &onion2, None).unwrap_err();
+        let err = ac.admit_peer("J5nickAAAAAAAA0", Some(&onion2), None).unwrap_err();
+        assert!(matches!(err, AdmissionError::DuplicateNick(_)));
+    }
+
+    #[test]
+    fn test_duplicate_nick_rejected_taker_vs_taker() {
+        let ac = AdmissionController::new();
+        ac.admit_peer("J5nickAAAAAAAA0", None, None).unwrap();
+        let err = ac.admit_peer("J5nickAAAAAAAA0", None, None).unwrap_err();
+        assert!(matches!(err, AdmissionError::DuplicateNick(_)));
+    }
+
+    #[test]
+    fn test_duplicate_nick_rejected_taker_vs_maker() {
+        let ac = AdmissionController::new();
+        // Taker connects first
+        ac.admit_peer("J5nickAAAAAAAA0", None, None).unwrap();
+        // Maker with same nick must be blocked
+        let onion = make_onion_addr();
+        let err = ac.admit_peer("J5nickAAAAAAAA0", Some(&onion), None).unwrap_err();
         assert!(matches!(err, AdmissionError::DuplicateNick(_)));
     }
 
@@ -150,25 +203,18 @@ mod tests {
     fn test_duplicate_nick_released_allows_readmit() {
         let ac = AdmissionController::new();
         let onion = make_onion_addr();
-        ac.admit_peer("J5nickAAAAAAAA0", &onion, None).unwrap();
-        ac.release_peer("J5nickAAAAAAAA0");
+        ac.admit_peer("J5nickAAAAAAAA0", Some(&onion), None).unwrap();
+        ac.release_peer("J5nickAAAAAAAA0", true);
         // After release the nick slot is free again
-        assert!(ac.admit_peer("J5nickAAAAAAAA0", &onion, None).is_ok());
-    }
-
-    #[test]
-    fn test_admit_taker_increments_peer_count() {
-        let ac = AdmissionController::new();
-        let onion = make_onion_addr();
-        assert!(ac.admit_peer("J5nickAAAAAAAA0", &onion, None).is_ok());
-        assert_eq!(ac.peer_count.load(Ordering::Acquire), 1);
+        assert!(ac.admit_peer("J5nickAAAAAAAA0", Some(&onion), None).is_ok());
     }
 
     #[test]
     fn test_makers_and_takers_share_cap() {
         let ac = AdmissionController::new();
-        ac.admit_peer("J5nick0000000000OO", &make_onion_addr(), None).unwrap();
-        ac.admit_peer("J5nick0000000001OO", &make_onion_addr2(), None).unwrap();
+        // One maker, one taker — both count against the shared cap
+        ac.admit_peer("J5nick0000000000OO", Some(&make_onion_addr()), None).unwrap();
+        ac.admit_peer("J5nick0000000001OO", None, None).unwrap();
         assert_eq!(ac.peer_count.load(Ordering::Acquire), 2);
     }
 
@@ -176,17 +222,33 @@ mod tests {
     fn test_release_decrements_peer_count_for_maker() {
         let ac = AdmissionController::new();
         let onion = make_onion_addr();
-        ac.admit_peer("J5nickAAAAAAAA0", &onion, None).unwrap();
-        ac.release_peer("J5nickAAAAAAAA0");
+        ac.admit_peer("J5nickAAAAAAAA0", Some(&onion), None).unwrap();
+        ac.release_peer("J5nickAAAAAAAA0", true);
         assert_eq!(ac.peer_count.load(Ordering::Acquire), 0);
     }
 
     #[test]
     fn test_release_decrements_peer_count_for_taker() {
         let ac = AdmissionController::new();
-        let onion = make_onion_addr();
-        ac.admit_peer("J5nickAAAAAAAA0", &onion, None).unwrap();
-        ac.release_peer("J5nickAAAAAAAA0");
+        ac.admit_peer("J5nickAAAAAAAA0", None, None).unwrap();
+        ac.release_peer("J5nickAAAAAAAA0", false);
         assert_eq!(ac.peer_count.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn test_release_taker_does_not_touch_sybil_guard() {
+        // Releasing a taker with is_maker=false must not attempt to deregister
+        // from the sybil guard or bond registry (they have no entries for takers).
+        // Verifiable by re-admitting a maker with the same onion after the taker
+        // releases — the sybil guard slot was never claimed so it must succeed.
+        let ac = AdmissionController::new();
+        let onion = make_onion_addr();
+
+        // Taker admits and releases
+        ac.admit_peer("J5takerNickOOOOO", None, None).unwrap();
+        ac.release_peer("J5takerNickOOOOO", false);
+
+        // Maker with the same onion should be admitted cleanly
+        assert!(ac.admit_peer("J5makerNickOOOOO", Some(&onion), None).is_ok());
     }
 }

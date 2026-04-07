@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use joinmarket_tor::provider::TorProvider;
@@ -7,6 +8,14 @@ use joinmarket_core::nick::{Nick, Network as NickNetwork};
 use crate::router::Router;
 use crate::admission::AdmissionController;
 use crate::peer::{handle_peer, PeerContext};
+
+/// Hard ceiling on concurrent TCP connections regardless of role.
+/// Connections that would exceed this are dropped before a task is spawned,
+/// before a broadcast receiver is allocated, and before any handshake bytes
+/// are read. This prevents a flood of taker connections from exhausting file
+/// descriptors and Tokio task memory even after the per-role admission caps
+/// inside `AdmissionController` are reached.
+const MAX_CONCURRENT_CONNECTIONS: usize = 110_000;
 
 pub async fn run_accept_loop(
     tor: Arc<dyn TorProvider>,
@@ -25,7 +34,7 @@ pub async fn run_accept_loop(
     };
     let (directory_nick, _) = Nick::generate(nick_network);
     let directory_nick = directory_nick.to_string();
-    let directory_location = format!("{}:5222", directory_onion);
+    let directory_location = format!("{}:{}", directory_onion, crate::VIRTUAL_PORT);
 
     // Store DN identity in router so peers can include it in peerlist responses.
     router.set_identity(directory_nick.clone(), directory_location);
@@ -43,15 +52,47 @@ pub async fn run_accept_loop(
 
     let mut tasks = JoinSet::new();
 
+    // Tracks every connection that currently has a live peer task, including
+    // those still in the handshake phase. Decremented by a RAII guard inside
+    // the spawned task so the count stays accurate even on panics.
+    let active_connections = Arc::new(AtomicUsize::new(0));
+
     loop {
         tokio::select! {
             result = tor.accept() => {
                 match result {
                     Ok(conn) => {
+                        // Enforce the connection ceiling BEFORE spawning a task.
+                        // This drops the connection at the OS level (RST) without
+                        // allocating a broadcast receiver or reading any bytes.
+                        let prev = active_connections.fetch_add(1, Ordering::AcqRel);
+                        if prev >= MAX_CONCURRENT_CONNECTIONS {
+                            active_connections.fetch_sub(1, Ordering::AcqRel);
+                            metrics::counter!("jm_connections_rejected_capacity_total").increment(1);
+                            tracing::warn!(
+                                active = prev,
+                                limit = MAX_CONCURRENT_CONNECTIONS,
+                                "Connection limit reached; dropping incoming connection"
+                            );
+                            drop(conn);
+                            continue;
+                        }
+
                         let ctx = ctx.clone();
                         let peer_shutdown = shutdown.clone();
+                        let active_connections = active_connections.clone();
 
                         tasks.spawn(async move {
+                            // RAII guard: decrement on task exit regardless of how
+                            // handle_peer returns (normal, early return, or panic).
+                            struct ConnectionGuard(Arc<AtomicUsize>);
+                            impl Drop for ConnectionGuard {
+                                fn drop(&mut self) {
+                                    self.0.fetch_sub(1, Ordering::AcqRel);
+                                }
+                            }
+                            let _guard = ConnectionGuard(active_connections);
+
                             handle_peer(
                                 conn.reader,
                                 conn.writer,

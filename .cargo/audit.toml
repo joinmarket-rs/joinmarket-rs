@@ -3,7 +3,14 @@
 # Add to CI: cargo audit
 
 [advisories]
-ignore = []
+# RUSTSEC-2023-0071 — Marvin Attack in `rsa` crate.
+# No fixed version available upstream. Affects the `arti` feature only
+# (embedded Tor backend). The default `tordaemon` build is not affected.
+# cargo-deny doesn't see it (runs with default features); cargo audit scans
+# the full Cargo.lock and does, so we suppress it here only.
+ignore = [
+    "RUSTSEC-2023-0071",
+]
 [output]
 # Vulnerabilities (non-informational) are always hard errors regardless of
 # this list. We do not add "yanked" here because unicode-segmentation 1.13.0

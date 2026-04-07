@@ -32,6 +32,8 @@ pub enum NickError {
     WrongLength(usize),
     #[error("invalid version byte '{0}': expected '5' (mainnet) or 'M' (testnet/signet)")]
     InvalidVersionByte(char),
+    #[error("nick version byte '{got}' does not match network '{network}' (expected '{expected}')")]
+    WrongVersionForNetwork { network: String, expected: char, got: char },
     #[error("invalid base58 in nick hash portion")]
     InvalidBase58,
     #[error("invalid nick signature")]
@@ -108,6 +110,29 @@ impl Nick {
             }
         }
         Ok(Nick(s.to_string()))
+    }
+
+    /// Validate `s` as a nick AND check that its version byte is consistent
+    /// with `network` (`'5'` for `"mainnet"`, `'M'` for `"testnet"`/`"signet"`).
+    /// This prevents a peer on mainnet from connecting with a testnet-flavoured
+    /// nick (or vice versa) without any diagnostic.
+    pub fn from_str_for_network(s: &str, network: &str) -> Result<Nick, NickError> {
+        let nick = Self::from_str(s)?;
+        // Mirror the Network::version_byte() mapping.
+        let expected: u8 = match network {
+            "testnet" | "signet" => b'M',
+            _ => b'5',
+        };
+        // `from_str` already validated length >= NICK_TOTAL_LEN, so index 1 is safe.
+        let got = s.as_bytes()[1];
+        if got != expected {
+            return Err(NickError::WrongVersionForNetwork {
+                network: network.to_string(),
+                expected: expected as char,
+                got: got as char,
+            });
+        }
+        Ok(nick)
     }
 
     pub fn as_str(&self) -> &str { &self.0 }
@@ -344,6 +369,50 @@ mod tests {
         }
         // If the encoded string is too long for NICK_TOTAL_LEN, it would fail WrongLength instead,
         // which is also correct.
+    }
+
+    #[test]
+    fn test_from_str_for_network_mainnet_ok() {
+        // '5' version byte is valid on mainnet
+        let nick = Nick::from_str_for_network("J5xhGSWE7VrxM7sO", "mainnet");
+        assert!(nick.is_ok());
+    }
+
+    #[test]
+    fn test_from_str_for_network_testnet_ok() {
+        // 'M' version byte is valid on testnet
+        let nick = Nick::from_str_for_network("JMxhGSWE7VrxM7sO", "testnet");
+        assert!(nick.is_ok());
+    }
+
+    #[test]
+    fn test_from_str_for_network_signet_ok() {
+        // 'M' version byte is valid on signet
+        let nick = Nick::from_str_for_network("JMxhGSWE7VrxM7sO", "signet");
+        assert!(nick.is_ok());
+    }
+
+    #[test]
+    fn test_from_str_for_network_mainnet_nick_rejected_on_testnet() {
+        // '5' version byte must be rejected on testnet
+        let err = Nick::from_str_for_network("J5xhGSWE7VrxM7sO", "testnet").unwrap_err();
+        assert!(matches!(err, NickError::WrongVersionForNetwork { .. }),
+            "expected WrongVersionForNetwork, got {:?}", err);
+    }
+
+    #[test]
+    fn test_from_str_for_network_testnet_nick_rejected_on_mainnet() {
+        // 'M' version byte must be rejected on mainnet
+        let err = Nick::from_str_for_network("JMxhGSWE7VrxM7sO", "mainnet").unwrap_err();
+        assert!(matches!(err, NickError::WrongVersionForNetwork { .. }),
+            "expected WrongVersionForNetwork, got {:?}", err);
+    }
+
+    #[test]
+    fn test_from_str_for_network_unknown_network_treated_as_mainnet() {
+        // Unknown network strings fall through to the mainnet default ('5')
+        assert!(Nick::from_str_for_network("J5xhGSWE7VrxM7sO", "regtest").is_ok());
+        assert!(Nick::from_str_for_network("JMxhGSWE7VrxM7sO", "regtest").is_err());
     }
 
     #[test]

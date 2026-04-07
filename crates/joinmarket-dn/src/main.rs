@@ -6,7 +6,7 @@ use tokio_util::sync::CancellationToken;
 use joinmarket_dn::{router, admission, heartbeat, server, metrics};
 use joinmarket_tor::TorBackendConfig;
 
-const VIRTUAL_PORT: u16 = 5222;
+use joinmarket_dn::VIRTUAL_PORT;
 
 #[derive(Parser, Debug)]
 #[command(name = "joinmarket-dn")]

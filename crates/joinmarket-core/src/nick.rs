@@ -156,7 +156,7 @@ impl NickSig {
     pub fn to_bytes(&self) -> [u8; 65] {
         let (rec_id, sig_bytes) = self.0.serialize_compact();
         let mut out = [0u8; 65];
-        out[0] = rec_id.to_i32() as u8;
+        out[0] = i32::from(rec_id) as u8;
         out[1..].copy_from_slice(&sig_bytes);
         out
     }
@@ -165,7 +165,7 @@ impl NickSig {
         if bytes.len() != 65 {
             return Err(NickError::InvalidSignature);
         }
-        let rec_id = RecoveryId::from_i32(bytes[0] as i32)
+        let rec_id = RecoveryId::try_from(bytes[0] as i32)
             .map_err(|_| NickError::InvalidSignature)?;
         let sig_bytes: [u8; 64] = bytes[1..].try_into().expect("length checked above");
         let sig = RecoverableSignature::from_compact(&sig_bytes, rec_id)

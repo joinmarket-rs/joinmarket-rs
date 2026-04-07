@@ -36,10 +36,6 @@ optional = true
 version = "0.8"
 optional = true
 
-[dependencies.libsqlite3-sys]
-version = "0.36"
-features = ["bundled"]
-optional = true
 
 [features]
 default = ["tordaemon"]
@@ -50,7 +46,6 @@ arti = [         # Arti embedded Tor backend; pulls in LGPL equix/hashx for PoW
     "dep:tor-rtcompat",
     "dep:tor-cell",
     "dep:safelog",
-    "dep:libsqlite3-sys",
 ]
 # NOTE: arti and tordaemon are mutually exclusive.
 # To build with Arti: cargo build --no-default-features --features arti

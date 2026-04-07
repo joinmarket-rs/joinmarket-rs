@@ -243,7 +243,7 @@ envelope-level message types (integer discriminators), not `!`-prefixed JoinMark
 
 - Use **4 KB** `BufReader`/`BufWriter` (not the Tokio default 8 KB). JoinMarket messages are always under 2 KB.
 - Use **`Arc<str>`** not `String` for nicks and broadcast payloads stored in the registry.
-- Use **`ShardedRegistry<T>`** (64 `parking_lot::Mutex<HashMap<Arc<str>, T>>` shards) for maker/taker registries.
+- Use **`ShardedRegistry<T>`** (64 `parking_lot::Mutex<HashMap<Arc<str>, T>>` shards) for maker/taker registries. Each registry holds its own `RandomState` seeded at construction; `shard_for` takes `&self` and uses `BuildHasher::hash_one()`. **Never use `DefaultHasher::new()`** — it is deterministic and allows an attacker to craft nicks that all land on one shard.
 - Use **`DashMap<Arc<str>, PeerMeta>`** for peer metadata.
 - Broadcast channel capacity: **1024**. Peers that lag are disconnected with `RecvError::Lagged`.
 
@@ -275,6 +275,16 @@ cargo audit
   otherwise `cargo deny check licenses` errors on them as unlicensed.
 - **Arti-only advisories** are suppressed in `deny.toml` with documented reasons. Do not
   remove those entries without confirming the upstream fix is available.
+
+### `secp256k1` version notes
+
+- We use **`secp256k1 = "0.30"`** with `features = ["global-context", "rand", "recovery"]`.
+- `rand-std` was the feature name in 0.28/0.29; it was removed in 0.30. Use `rand` from 0.29 onwards.
+- `RecoveryId::from_i32()` / `to_i32()` were removed in 0.30. Use `RecoveryId::try_from(i32)` and
+  `i32::from(RecoveryId)` instead.
+- `secp256k1::rand` is re-exported by the crate when the `rand` feature is enabled, so
+  `secp256k1::rand::thread_rng()` still works in 0.30 without adding a separate `rand` import.
+- Upgrading to 0.31+ also bumps the `rand` dep to 0.9 — that is a separate migration step.
 
 ### `cargo audit` (v0.22+) — `.cargo/audit.toml`
 

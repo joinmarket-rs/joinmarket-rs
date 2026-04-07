@@ -5,7 +5,8 @@ use joinmarket_core::fidelity_bond::FidelityBondProof;
 use crate::sybil_guard::{SybilGuard, SybilError};
 use crate::bond_registry::{FidelityBondRegistry, BondError};
 
-const MAX_CONCURRENT_MAKERS: u32 = 100_000;
+/// Maximum number of concurrently connected peers (makers + takers combined).
+const MAX_CONCURRENT_PEERS: u32 = 100_000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AdmissionError {
@@ -13,14 +14,14 @@ pub enum AdmissionError {
     Sybil(#[from] SybilError),
     #[error("bond UTXO duplicate: {0}")]
     BondDuplicate(#[from] BondError),
-    #[error("maker capacity reached ({0})")]
-    MakerCapacity(u32),
+    #[error("peer capacity reached ({0})")]
+    PeerCapacity(u32),
 }
 
 pub struct AdmissionController {
     sybil_guard: SybilGuard,
     bond_registry: FidelityBondRegistry,
-    maker_count: AtomicU32,
+    peer_count: AtomicU32,
 }
 
 impl Default for AdmissionController {
@@ -34,7 +35,7 @@ impl AdmissionController {
         AdmissionController {
             sybil_guard: SybilGuard::new(),
             bond_registry: FidelityBondRegistry::new(),
-            maker_count: AtomicU32::new(0),
+            peer_count: AtomicU32::new(0),
         }
     }
 
@@ -43,7 +44,6 @@ impl AdmissionController {
         &self,
         nick: &str,
         onion_addr: &OnionServiceAddr,
-        is_maker: bool,
         bond: Option<&FidelityBondProof>,
     ) -> Result<(), AdmissionError> {
         // Layer 2: Sybil guard
@@ -61,30 +61,26 @@ impl AdmissionController {
             }
         }
 
-        // Layer 4: Maker capacity cap
-        if is_maker {
-            // Atomically reserve a slot; roll back if over capacity.
-            let prev = self.maker_count.fetch_add(1, Ordering::AcqRel);
-            if prev >= MAX_CONCURRENT_MAKERS {
-                self.maker_count.fetch_sub(1, Ordering::AcqRel);
-                self.sybil_guard.deregister(nick);
-                if bond.is_some() {
-                    self.bond_registry.deregister_nick(nick);
-                }
-                metrics::counter!("jm_admission_maker_cap_rejections_total").increment(1);
-                return Err(AdmissionError::MakerCapacity(prev));
+        // Layer 4: Global peer capacity cap (makers + takers combined).
+        // Atomically reserve a slot; roll back all prior layers if over capacity.
+        let prev = self.peer_count.fetch_add(1, Ordering::AcqRel);
+        if prev >= MAX_CONCURRENT_PEERS {
+            self.peer_count.fetch_sub(1, Ordering::AcqRel);
+            self.sybil_guard.deregister(nick);
+            if bond.is_some() {
+                self.bond_registry.deregister_nick(nick);
             }
+            metrics::counter!("jm_admission_peer_cap_rejections_total").increment(1);
+            return Err(AdmissionError::PeerCapacity(prev));
         }
 
         Ok(())
     }
 
-    pub fn release_peer(&self, nick: &str, is_maker: bool) {
+    pub fn release_peer(&self, nick: &str) {
         self.sybil_guard.deregister(nick);
         self.bond_registry.deregister_nick(nick);
-        if is_maker {
-            self.maker_count.fetch_sub(1, Ordering::AcqRel);
-        }
+        self.peer_count.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -99,38 +95,51 @@ mod tests {
         ).unwrap()
     }
 
-    #[test]
-    fn test_admit_maker_ok() {
-        let ac = AdmissionController::new();
-        let onion = make_onion_addr();
-        assert!(ac.admit_peer("J5nickAAAAAAAA0", &onion, true, None).is_ok());
-        assert_eq!(ac.maker_count.load(Ordering::Acquire), 1);
+    fn make_onion_addr2() -> OnionServiceAddr {
+        OnionServiceAddr::parse(
+            "coinjointovy3eq5fjygdwpkbcdx63d7vd4g32mw7y553uj3kjjzkiqd.onion:5222"
+        ).unwrap()
     }
 
     #[test]
-    fn test_rollback_on_capacity_exceeded() {
+    fn test_admit_maker_increments_peer_count() {
         let ac = AdmissionController::new();
         let onion = make_onion_addr();
-        // Admit one maker
-        ac.admit_peer("J5nick0000000000OO", &onion, true, None).unwrap();
-        assert!(ac.sybil_guard.is_nick_active("J5nick0000000000OO"));
+        assert!(ac.admit_peer("J5nickAAAAAAAA0", &onion, None).is_ok());
+        assert_eq!(ac.peer_count.load(Ordering::Acquire), 1);
     }
 
     #[test]
-    fn test_maker_cap_uses_distinct_metric() {
+    fn test_admit_taker_increments_peer_count() {
         let ac = AdmissionController::new();
         let onion = make_onion_addr();
-        // Admit one maker
-        ac.admit_peer("J5nick0000000000OO", &onion, true, None).unwrap();
-        assert_eq!(ac.maker_count.load(Ordering::Acquire), 1);
+        assert!(ac.admit_peer("J5nickAAAAAAAA0", &onion, None).is_ok());
+        assert_eq!(ac.peer_count.load(Ordering::Acquire), 1);
     }
 
     #[test]
-    fn test_release_decrements_maker_count() {
+    fn test_makers_and_takers_share_cap() {
+        let ac = AdmissionController::new();
+        ac.admit_peer("J5nick0000000000OO", &make_onion_addr(), None).unwrap();
+        ac.admit_peer("J5nick0000000001OO", &make_onion_addr2(), None).unwrap();
+        assert_eq!(ac.peer_count.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn test_release_decrements_peer_count_for_maker() {
         let ac = AdmissionController::new();
         let onion = make_onion_addr();
-        ac.admit_peer("J5nickAAAAAAAA0", &onion, true, None).unwrap();
-        ac.release_peer("J5nickAAAAAAAA0", true);
-        assert_eq!(ac.maker_count.load(Ordering::Acquire), 0);
+        ac.admit_peer("J5nickAAAAAAAA0", &onion, None).unwrap();
+        ac.release_peer("J5nickAAAAAAAA0");
+        assert_eq!(ac.peer_count.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn test_release_decrements_peer_count_for_taker() {
+        let ac = AdmissionController::new();
+        let onion = make_onion_addr();
+        ac.admit_peer("J5nickAAAAAAAA0", &onion, None).unwrap();
+        ac.release_peer("J5nickAAAAAAAA0");
+        assert_eq!(ac.peer_count.load(Ordering::Acquire), 0);
     }
 }

@@ -615,7 +615,7 @@ pub struct PeersResponse {
 }
 ```
 
-**ShardedRegistry:** 64 shards, keyed by a hash of the full nick string modulo 64 (using `DefaultHasher`). Each shard is a `parking_lot::Mutex<HashMap<Arc<str>, PeerInfo>>`. This avoids a single global lock hot-spot at high peer counts and ensures even distribution across shards regardless of nick prefix patterns.
+**ShardedRegistry:** 64 shards, keyed by a hash of the full nick string modulo 64. Each shard is a `parking_lot::Mutex<HashMap<Arc<str>, PeerInfo>>`. The hash uses a `RandomState` seeded with OS random bytes at construction time (via `BuildHasher::hash_one()`), preventing an adversary from crafting nicks that all collide on one shard. This avoids a single global lock hot-spot at high peer counts and ensures even distribution across shards regardless of nick prefix patterns.
 
 **Broadcast channels:** Two separate `tokio::sync::broadcast` channels with independent capacities:
 
@@ -812,7 +812,7 @@ jm_broadcast_lag_evictions_total{channel="all|takers"}    counter
 
 ```toml
 [dependencies]
-secp256k1 = { version = "0.28", features = ["global-context", "rand-std", "recovery"] }
+secp256k1 = { version = "0.30", features = ["global-context", "rand", "recovery"] }
 x25519-dalek = { version = "2", features = ["static_secrets", "getrandom"] }
 crypto_secretbox = "0.1"     # XSalsa20Poly1305 for NaCl box encryption
 bitcoin_hashes = "0.13"
@@ -861,10 +861,6 @@ optional = true
 version = "0.8"
 optional = true
 
-[dependencies.libsqlite3-sys]
-version = "0.36"
-features = ["bundled"]
-optional = true
 
 [features]
 default = ["tordaemon"]
@@ -875,7 +871,6 @@ arti = [         # Arti embedded Tor backend
     "dep:tor-rtcompat",
     "dep:tor-cell",
     "dep:safelog",
-    "dep:libsqlite3-sys",
 ]
 ```
 

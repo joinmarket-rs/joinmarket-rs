@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
+use std::hash::BuildHasher;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use parking_lot::Mutex;
@@ -13,10 +13,6 @@ const SHARD_COUNT: usize = 64;
 /// All-peers channel: carries only low-frequency messages (`!orderbook`, `!hp2`,
 /// disconnect notifications). 256 slots is ample for this traffic.
 const BROADCAST_CAPACITY_ALL: usize = 256;
-/// Minimum time between consecutive forwarded `!orderbook` broadcasts.
-/// Regardless of how many takers send `!orderbook` simultaneously, the DN
-/// forwards at most one every 10 seconds, bounding maker response amplification.
-const ORDERBOOK_BROADCAST_INTERVAL: Duration = Duration::from_secs(10);
 /// Takers-only channel: carries low-frequency offer startup announcements,
 /// offer-list updates, !cancel, and !tbond. 256 slots matches the all-peers
 /// channel; !orderbook responses are privmsgs and never enter this ring.
@@ -38,7 +34,6 @@ pub struct MakerInfo {
     pub nick: Arc<str>,
     pub onion_address: OnionServiceAddr,
     pub fidelity_bond: Option<Arc<FidelityBondProof>>,
-    pub last_ann: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -67,34 +62,37 @@ struct PeerMeta {
 
 struct ShardedRegistry<T> {
     shards: Vec<Mutex<HashMap<Arc<str>, T>>>,
+    /// Random seed chosen at construction time; prevents hash-flooding attacks
+    /// where an adversary crafts nick strings that all map to the same shard.
+    hash_builder: std::collections::hash_map::RandomState,
 }
 
 impl<T: Clone> ShardedRegistry<T> {
     fn new() -> Self {
-        let shards = (0..SHARD_COUNT)
-            .map(|_| Mutex::new(HashMap::new()))
-            .collect();
-        ShardedRegistry { shards }
+        ShardedRegistry {
+            shards: (0..SHARD_COUNT)
+                .map(|_| Mutex::new(HashMap::new()))
+                .collect(),
+            hash_builder: std::collections::hash_map::RandomState::new(),
+        }
     }
 
-    fn shard_for(nick: &str) -> usize {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        nick.hash(&mut hasher);
-        hasher.finish() as usize % SHARD_COUNT
+    fn shard_for(&self, nick: &str) -> usize {
+        self.hash_builder.hash_one(nick) as usize % SHARD_COUNT
     }
 
     fn insert(&self, nick: Arc<str>, info: T) {
-        let idx = Self::shard_for(&nick);
+        let idx = self.shard_for(&nick);
         self.shards[idx].lock().insert(nick, info);
     }
 
     fn remove(&self, nick: &str) {
-        let idx = Self::shard_for(nick);
+        let idx = self.shard_for(nick);
         self.shards[idx].lock().remove(nick);
     }
 
     fn get(&self, nick: &str) -> Option<T> {
-        let idx = Self::shard_for(nick);
+        let idx = self.shard_for(nick);
         self.shards[idx].lock().get(nick).cloned()
     }
 
@@ -118,8 +116,7 @@ pub struct Router {
     /// disconnect notifications, and other messages that makers must receive.
     broadcast_tx: broadcast::Sender<BroadcastMsg>,
     /// Broadcast channel for takers only. Carries offer announcements (`!sw0absoffer`,
-    /// etc.), `!cancel`, and `!tbond` — messages makers have no use for. Sized
-    /// to absorb the peak `!orderbook` response burst without overflowing.
+    /// etc.), `!cancel`, and `!tbond` — messages makers have no use for.
     broadcast_tx_takers: broadcast::Sender<BroadcastMsg>,
     /// Consolidated per-peer metadata (shutdown token, probe channel, ping support, last_seen, pong_pending).
     peer_meta: DashMap<Arc<str>, PeerMeta>,
@@ -127,8 +124,6 @@ pub struct Router {
     dn_nick: Mutex<String>,
     /// Directory node's own location-string, e.g. "xxxx.onion:5222".
     dn_location: Mutex<String>,
-    /// Timestamp of the last forwarded `!orderbook` broadcast (global throttle).
-    last_orderbook_broadcast: Mutex<Option<Instant>>,
 }
 
 impl Default for Router {
@@ -149,7 +144,6 @@ impl Router {
             peer_meta: DashMap::new(),
             dn_nick: Mutex::new(String::new()),
             dn_location: Mutex::new(String::new()),
-            last_orderbook_broadcast: Mutex::new(None),
         }
     }
 
@@ -337,35 +331,9 @@ impl Router {
         result
     }
 
-    /// Update the `last_ann` field for a registered maker.
-    pub fn update_maker_ann(&self, nick: &str, ann: String) {
-        let idx = ShardedRegistry::<MakerInfo>::shard_for(nick);
-        if let Some(info) = self.makers.shards[idx].lock().get_mut(nick) {
-            info.last_ann = Some(ann);
-        }
-    }
-
-    /// Broadcast an `!orderbook` message to all peers, subject to a global
-    /// minimum interval (`ORDERBOOK_BROADCAST_INTERVAL`). If an `!orderbook`
-    /// was forwarded too recently the message is silently dropped and the
-    /// `jm_orderbook_throttled_total` counter is incremented.
-    pub fn broadcast_orderbook(&self, sender_nick: &str, msg: Arc<str>) {
-        let mut last = self.last_orderbook_broadcast.lock();
-        let now = Instant::now();
-        if let Some(prev) = *last {
-            if now.duration_since(prev) < ORDERBOOK_BROADCAST_INTERVAL {
-                metrics::counter!("jm_orderbook_throttled_total").increment(1);
-                return;
-            }
-        }
-        *last = Some(now);
-        drop(last);
-        self.broadcast(sender_nick, msg);
-    }
-
     /// Broadcast to all connected peers (makers and takers).
-    /// Use for `!hp2`, disconnect notifications, and any message that makers
-    /// must receive. For `!orderbook` use `broadcast_orderbook` instead.
+    /// Use for `!orderbook`, `!hp2`, disconnect notifications, and any message
+    /// that makers must receive.
     pub fn broadcast(&self, sender_nick: &str, msg: Arc<str>) {
         let _ = self.broadcast_tx.send(BroadcastMsg {
             sender_nick: Arc::from(sender_nick),
@@ -425,7 +393,6 @@ mod tests {
             nick: nick.clone(),
             onion_address: make_onion_addr(),
             fidelity_bond: None,
-            last_ann: None,
         });
 
         assert_eq!(router.maker_count(), 1);
@@ -445,7 +412,6 @@ mod tests {
             nick: nick.clone(),
             onion_address: onion.clone(),
             fidelity_bond: None,
-            last_ann: None,
         });
 
         let located = router.locate_peer("J5testNickOOOOOO");
@@ -462,7 +428,6 @@ mod tests {
             nick: maker_nick,
             onion_address: make_onion_addr(),
             fidelity_bond: None,
-            last_ann: None,
         });
 
         let taker_nick: Arc<str> = "J5takerNickOOOOO".into();
@@ -612,12 +577,13 @@ mod tests {
 
     #[test]
     fn test_shard_distribution_with_realistic_nicks() {
-        // All JoinMarket nicks start with 'J5' — verify that the hash-based
-        // shard function distributes them across multiple shards, not just one.
+        // All JoinMarket nicks start with 'J5' — verify that the randomly-seeded
+        // hash function distributes them across multiple shards, not just one.
+        let registry = ShardedRegistry::<()>::new();
         let mut shard_counts = vec![0usize; SHARD_COUNT];
         for i in 0..1000 {
             let nick = format!("J5nick{:010}OO", i);
-            let shard = ShardedRegistry::<()>::shard_for(&nick);
+            let shard = registry.shard_for(&nick);
             shard_counts[shard] += 1;
         }
         let used_shards = shard_counts.iter().filter(|&&c| c > 0).count();

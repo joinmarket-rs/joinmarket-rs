@@ -249,7 +249,7 @@ pub async fn handle_peer(
 
     // Admission control (layers 2, 3, 4) — only for makers (who have an onion addr)
     if let Some(ref onion) = peer_onion {
-        if let Err(e) = admission.admit_peer(nick.as_ref(), onion, is_maker, bond.as_ref()) {
+        if let Err(e) = admission.admit_peer(nick.as_ref(), onion, bond.as_ref()) {
             tracing::warn!(nick = %nick, error = %e, "Admission rejected");
             return;
         }
@@ -274,7 +274,6 @@ pub async fn handle_peer(
                 nick: nick.clone(),
                 onion_address: onion.clone(),
                 fidelity_bond: bond.map(Arc::new),
-                last_ann: None,
             });
         }
     } else {
@@ -331,7 +330,6 @@ pub async fn handle_peer(
                         if let Err(e) = handle_message(
                             trimmed,
                             nick.clone(),
-                            is_maker,
                             &peer_onion,
                             router,
                             &mut writer,
@@ -439,7 +437,7 @@ pub async fn handle_peer(
     // Cleanup
     router.deregister(nick.as_ref());
     if peer_onion.is_some() {
-        admission.release_peer(nick.as_ref(), is_maker);
+        admission.release_peer(nick.as_ref());
     }
 
     tracing::info!(nick = %nick, "Peer disconnected and deregistered");
@@ -476,7 +474,6 @@ async fn send_dn_handshake(
 async fn handle_message(
     line: &str,
     nick: Arc<str>,
-    is_maker: bool,
     peer_onion: &Option<OnionServiceAddr>,
     router: &Router,
     writer: &mut BufWriter<BoxWriter>,
@@ -557,7 +554,7 @@ async fn handle_message(
                 }
 
                 if let Some(msg) = parsed_msg {
-                    dispatch_pubmsg(msg, body, nick.clone(), is_maker, router, writer).await?;
+                    dispatch_pubmsg(msg, body, nick.clone(), router, writer).await?;
                 }
             } else {
                 tracing::debug!(nick = %nick, "Ignoring malformed pubmsg line");
@@ -623,13 +620,9 @@ async fn dispatch_pubmsg(
     msg: JmMessage,
     body: &str,
     nick: Arc<str>,
-    is_maker: bool,
     router: &Router,
     _writer: &mut BufWriter<BoxWriter>,
 ) -> anyhow::Result<()> {
-    if is_maker && msg.command.is_offer() {
-        router.update_maker_ann(nick.as_ref(), body.to_string());
-    }
     broadcast_pubmsg(&nick, &msg.command, body, router);
     Ok(())
 }

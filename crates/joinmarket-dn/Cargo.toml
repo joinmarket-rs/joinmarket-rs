@@ -25,7 +25,7 @@ rand = "0.8"
 tokio-util = { version = "0.7", features = ["codec"] }
 anyhow = "1"
 thiserror = "1"
-base64 = "0.21"
+base64 = "0.22"
 metrics = "0.23"
 metrics-exporter-prometheus = { version = "0.15", default-features = false, features = ["http-listener"] }
 

@@ -44,7 +44,8 @@ impl FidelityBondProof {
         cert_pubkey.copy_from_slice(&decoded[offset..offset + 33]);
         offset += 33;
 
-        let cert_expiry = u16::from_be_bytes(decoded[offset..offset + 2].try_into().unwrap());
+        // Python serialises with struct.pack('<..H..II', ...) — little-endian.
+        let cert_expiry = u16::from_le_bytes(decoded[offset..offset + 2].try_into().unwrap());
         offset += 2;
 
         let mut utxo_pubkey = [0u8; 33];
@@ -55,10 +56,10 @@ impl FidelityBondProof {
         txid.copy_from_slice(&decoded[offset..offset + 32]);
         offset += 32;
 
-        let vout = u32::from_be_bytes(decoded[offset..offset + 4].try_into().unwrap());
+        let vout = u32::from_le_bytes(decoded[offset..offset + 4].try_into().unwrap());
         offset += 4;
 
-        let timelock = u32::from_be_bytes(decoded[offset..offset + 4].try_into().unwrap());
+        let timelock = u32::from_le_bytes(decoded[offset..offset + 4].try_into().unwrap());
 
         Ok(FidelityBondProof {
             nick_sig,

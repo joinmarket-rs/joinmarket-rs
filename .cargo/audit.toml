@@ -3,18 +3,7 @@
 # Add to CI: cargo audit
 
 [advisories]
-# ── Per-advisory ignores ──────────────────────────────────────────────────────
-# All entries are arti-feature-only transitive dependencies with no available
-# fix. They do NOT affect the default `tordaemon` build.
-ignore = [
-    # rsa / Marvin Attack — no fixed version; arti feature only.
-    "RUSTSEC-2023-0071",
-    # bincode unmaintained — arti-only transitive dep; no owned code uses it.
-    "RUSTSEC-2025-0141",
-    # paste unmaintained — arti-only transitive dep; no owned code uses it.
-    "RUSTSEC-2024-0436",
-]
-
+ignore = []
 [output]
 # Vulnerabilities (non-informational) are always hard errors regardless of
 # this list. We do not add "yanked" here because unicode-segmentation 1.13.0

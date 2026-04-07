@@ -374,12 +374,6 @@ checksum = "4c7f02d4ea65f2c1853089ffd8d2787bdbc63de2f0d29dedbcf8ccdfa0ccd4cf"
 
 [[package]]
 name = "base64"
-version = "0.21.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d297deb1925b89f2ccc13d7635fa0714f12c87adce1c75356b39ca9b7178567"
-
-[[package]]
-name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
@@ -2253,7 +2247,7 @@ dependencies = [
 name = "joinmarket-core"
 version = "0.2.0-alpha"
 dependencies = [
- "base64 0.21.7",
+ "base64",
  "bitcoin_hashes 0.13.0",
  "bs58",
  "crypto_secretbox",
@@ -2275,7 +2269,7 @@ name = "joinmarket-dn"
 version = "0.2.0-alpha"
 dependencies = [
  "anyhow",
- "base64 0.21.7",
+ "base64",
  "clap",
  "dashmap",
  "joinmarket-core",
@@ -2507,7 +2501,7 @@ version = "0.15.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4f0c8427b39666bf970460908b213ec09b3b350f20c0c2eabcbba51704a08e6"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -3768,7 +3762,7 @@ version = "3.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd5414fad8e6907dbdd5bc441a50ae8d6e26151a03b1de04d89a5576de61d01f"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "chrono",
  "hex",
  "indexmap 1.9.3",

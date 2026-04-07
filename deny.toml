@@ -8,20 +8,7 @@
 # available fix; each entry documents why the suppression is safe.
 
 [advisories]
-ignore = [
-    # RUSTSEC-2023-0071 — Marvin Attack in `rsa` crate.
-    # No fixed version available upstream. Affects arti feature only
-    # (embedded Tor backend). The default `tordaemon` build is NOT affected.
-    { id = "RUSTSEC-2023-0071", reason = "No fix available; arti-feature-only transitive dep. Default tordaemon build is unaffected." },
-
-    # RUSTSEC-2025-0141 — `bincode` crate unmaintained.
-    # Arti-only transitive dependency; no joinmarket-rs code uses bincode directly.
-    { id = "RUSTSEC-2025-0141", reason = "Arti-only transitive dep; no owned code uses bincode." },
-
-    # RUSTSEC-2024-0436 — `paste` crate unmaintained.
-    # Arti-only transitive dependency; no joinmarket-rs code uses paste directly.
-    { id = "RUSTSEC-2024-0436", reason = "Arti-only transitive dep; no owned code uses paste." },
-]
+ignore = []
 
 # ── License policy ────────────────────────────────────────────────────────────
 

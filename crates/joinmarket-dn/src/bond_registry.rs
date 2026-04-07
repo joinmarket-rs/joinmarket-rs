@@ -83,7 +83,7 @@ mod tests {
     fn make_bond_with_vout(vout: u32) -> FidelityBondProof {
         let mut blob = vec![0u8; 252];
         // Set vout at offset 72+72+33+2+33+32 = 244
-        let vout_bytes = vout.to_be_bytes();
+        let vout_bytes = vout.to_le_bytes();
         blob[244..248].copy_from_slice(&vout_bytes);
         let encoded = base64::engine::general_purpose::STANDARD.encode(&blob);
         FidelityBondProof::parse_base64(&encoded).unwrap()

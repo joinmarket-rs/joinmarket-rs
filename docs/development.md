@@ -67,6 +67,11 @@
 - Handshake validation: wrong proto-ver, wrong network, malformed nick
 - `FidelityBondProof::parse_base64`: valid blobs and truncated/corrupted inputs
 - Config parsing: realistic `joinmarket.cfg`
+- `OnionAddress::parse()`: known-good v3, wrong length, missing suffix, bad checksum, mixed
+  case, v2 rejection, port edge cases (0, 65535) — and critically, **invalid base32 characters
+  must return `Err`, not panic** (see `test_invalid_base32_characters_return_error_not_panic`).
+  No `assert!` / `unwrap()` / `expect()` may appear in any code path that processes
+  peer-supplied bytes; a panic in a peer task kills the entire server process.
 
 ### Integration tests (`tests/integration/`)
 

@@ -53,7 +53,14 @@ impl OnionAddress {
             .decode(encoded.to_uppercase().as_bytes())
             .map_err(|e| OnionAddressError::InvalidBase32(e.to_string()))?;
 
-        assert_eq!(decoded.len(), 35, "base32 decode of 56-char v3 onion must be 35 bytes");
+        // Mathematically, BASE32_NOPAD always decodes 56 chars to exactly 35 bytes
+        // (56 × 5 bits = 280 bits = 35 bytes). The check below is defensive: if the
+        // upstream library ever changes behaviour we return an error rather than panic.
+        if decoded.len() != 35 {
+            return Err(OnionAddressError::InvalidBase32(
+                format!("expected 35 decoded bytes, got {}", decoded.len()),
+            ));
+        }
 
         let pubkey   = &decoded[0..32];
         let checksum = &decoded[32..34];
@@ -204,6 +211,23 @@ mod tests {
         let output = parsed.as_location_string();
         let reparsed = OnionServiceAddr::parse(&output).unwrap();
         assert_eq!(parsed, reparsed);
+    }
+
+    /// Ensures the decode-length guard returns `InvalidBase32` rather than panicking.
+    /// The length guard is mathematically unreachable through normal base32 decoding
+    /// (56 chars → exactly 35 bytes), but we verify the error *variant* is reachable
+    /// via the decode step with invalid base32 characters — which covers the same
+    /// `InvalidBase32` arm without requiring a real length discrepancy.
+    #[test]
+    fn test_invalid_base32_characters_return_error_not_panic() {
+        // '0' is not in the base32 alphabet (which is A-Z and 2-7).
+        // 56 '0' chars + ".onion" = exactly 62 chars — correct length but
+        // invalid base32 — so the decode step must return Err, not panic.
+        let bad = format!("{}.onion", "0".repeat(56));
+        assert_eq!(bad.len(), 62);
+        let result = OnionAddress::parse(&bad);
+        // Must be an error — not a panic.
+        assert!(result.is_err(), "expected an error for invalid base32, got Ok");
     }
 
     #[test]

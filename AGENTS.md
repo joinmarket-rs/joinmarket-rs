@@ -99,6 +99,9 @@ tests/fixtures/      # Reference JoinMarket wire payloads
 - Rust edition **2021**; minimum stable toolchain **1.75+**. No nightly features.
 - `#![forbid(unsafe_code)]` is declared in `joinmarket-core/src/lib.rs` and
   `joinmarket-dn/src/lib.rs`. **No unsafe code anywhere.**
+- **7-argument limit**: clippy enforces `too_many_arguments` (max 7). If a function needs
+  more, group the extras into a named struct (e.g. `RateLimitState`, `MessageContext`).
+- **Use `.is_some_and(|x| ...)` not `.map_or(false, |x| ...)`** — clippy flags the latter.
 
 ### Import Ordering
 
@@ -150,6 +153,10 @@ return Err(anyhow::anyhow!("pubmsg from_nick spoofing attempt"));
 
 Never silently swallow errors. On unrecoverable peer errors, break the select loop and let the task exit.
 
+**Always match error enums exhaustively** — never classify errors via `.to_string().contains(...)`.
+An exhaustive `match &e { HandshakeError::InvalidOnionAddress(_) => ..., ... }` means the compiler
+enforces that any future variant is handled and the correct metric/response is emitted for each case.
+
 ### Types — Use These, Not Alternatives
 
 | Prefer | Instead of | Reason |
@@ -179,6 +186,27 @@ Never silently swallow errors. On unrecoverable peer errors, break the select lo
 ## Critical Behavioral Rules
 
 These rules are invariants. Do not deviate from them.
+
+### No `assert!` / `unwrap()` / `expect()` on Peer-Supplied Data
+
+A panic inside an async peer task propagates as SIGABRT and kills the entire server process.
+Always return `Err(...)` instead:
+
+```rust
+// WRONG — panics the process if an attacker sends malformed input:
+assert_eq!(decoded.len(), 35, "...");
+
+// RIGHT — returns a typed error; the caller disconnects the peer:
+if decoded.len() != 35 {
+    return Err(OnionAddressError::InvalidBase32(
+        format!("expected 35 decoded bytes, got {}", decoded.len()),
+    ));
+}
+```
+
+This applies anywhere untrusted bytes pass through: `OnionAddress::parse`, `PeerHandshake::parse_json`,
+`OnionEnvelope::parse`, fidelity bond parsing, etc. `expect()` is acceptable only on
+values that are already validated or are program-internal invariants.
 
 ### Onion Address Validation
 
@@ -223,6 +251,43 @@ envelope-level message types (integer discriminators), not `!`-prefixed JoinMark
 
 `tordaemon` and `arti` features are mutually exclusive — a `compile_error!` enforces this. Never
 enable both simultaneously. The default is `tordaemon`.
+
+---
+
+## Security Tooling
+
+Three tools run against the workspace. All three must pass before a change is considered done.
+
+```bash
+cargo clippy --workspace -- -D warnings   # zero errors required
+cargo deny check advisories bans licenses sources
+cargo audit
+```
+
+### `cargo deny` (v0.19+) — `deny.toml`
+
+- **`[advisories]`** only accepts `ignore = [...]`. The old `vulnerability`, `unmaintained`,
+  `yanked`, `notice` fields no longer exist in 0.19+; they were removed. Vulnerabilities are
+  hard errors by default.
+- **`[bans].wildcards`** — path-only workspace deps (`joinmarket-core = { path = "..." }`)
+  have no version field and are flagged as wildcards. Use `wildcards = "warn"`, not `"deny"`.
+- **Workspace crates must declare `license`** in their `Cargo.toml` (`license = "MIT"`);
+  otherwise `cargo deny check licenses` errors on them as unlicensed.
+- **Arti-only advisories** are suppressed in `deny.toml` with documented reasons. Do not
+  remove those entries without confirming the upstream fix is available.
+
+### `cargo audit` (v0.22+) — `.cargo/audit.toml`
+
+- **`[output].deny`** accepts only `["warnings", "unmaintained", "unsound", "yanked"]`.
+  `"vulnerability"` is **not** a valid value and will fail to parse.
+- **`[output].quiet`** has no serde default and **must** be specified (`quiet = false`).
+  Omitting it causes a parse error.
+- **Yanked crates cannot be selectively ignored** via `[advisories].ignore` (which only
+  accepts advisory IDs like `RUSTSEC-...`). If a yanked crate is an arti-only transitive
+  dep with no fix, remove `"yanked"` from `deny` rather than break CI.
+- **Arti-only advisories** (RUSTSEC-2023-0071, RUSTSEC-2025-0141, RUSTSEC-2024-0436) and
+  the yanked `unicode-segmentation 1.13.0` are documented and suppressed. They affect the
+  `--features arti` build only; the default `tordaemon` build is unaffected.
 
 ---
 

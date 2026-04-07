@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
-use joinmarket_core::handshake::{PeerHandshake, DnHandshake, CURRENT_PROTO_VER};
+use joinmarket_core::handshake::{PeerHandshake, DnHandshake, HandshakeError, CURRENT_PROTO_VER};
 use joinmarket_core::message::{
     OnionEnvelope, msg_type,
     parse_pubmsg_line, parse_privmsg_line,
@@ -25,6 +25,14 @@ const MAX_PUBMSG_PER_MINUTE: usize = 30;
 /// The Python client sends one on connect and one after each coinjoin, so 3/min
 /// is already generous while preventing amplification attacks on makers.
 const MAX_ORDERBOOK_PER_MINUTE: usize = 3;
+
+/// Per-peer rate-limiting state threaded through `handle_message`.
+/// Grouping both deques into a single struct keeps the function argument count
+/// within clippy's 7-argument limit.
+struct RateLimitState {
+    pubmsg_timestamps: std::collections::VecDeque<Instant>,
+    orderbook_timestamps: std::collections::VecDeque<Instant>,
+}
 
 /// Read a `\n`-terminated line from a buffered reader without allocating beyond
 /// `max_len` bytes. Returns `Ok(n)` where `n` is the number of bytes read
@@ -188,14 +196,42 @@ pub async fn handle_peer(
                 error = %e,
                 "Handshake validation failed"
             );
-            if e.to_string().contains("onion") {
-                // Invalid onion address in location-string
-                metrics::counter!("jm_admission_invalid_onion_total").increment(1);
-            } else {
-                let reason = if e.to_string().contains("proto") { "proto_mismatch" } else { "network_mismatch" };
-                metrics::counter!("jm_handshakes_total", "result" => reason).increment(1);
-                // Send a rejected response before disconnecting
-                let _ = send_dn_handshake(&mut writer, directory_nick, &peer_handshake.nick, directory_onion, network, motd, false).await;
+            match &e {
+                HandshakeError::InvalidOnionAddress(_) => {
+                    // Silent disconnect — per spec, a malformed location-string gets
+                    // no response; the connection is simply closed.
+                    metrics::counter!("jm_admission_invalid_onion_total").increment(1);
+                }
+                HandshakeError::WrongAppName(_) => {
+                    metrics::counter!("jm_handshakes_total", "result" => "wrong_app_name").increment(1);
+                    let _ = send_dn_handshake(&mut writer, directory_nick, &peer_handshake.nick, directory_onion, network, motd, false).await;
+                }
+                HandshakeError::ProtoVerMismatch { .. } => {
+                    metrics::counter!("jm_handshakes_total", "result" => "proto_mismatch").increment(1);
+                    let _ = send_dn_handshake(&mut writer, directory_nick, &peer_handshake.nick, directory_onion, network, motd, false).await;
+                }
+                HandshakeError::NetworkMismatch { .. } => {
+                    metrics::counter!("jm_handshakes_total", "result" => "network_mismatch").increment(1);
+                    let _ = send_dn_handshake(&mut writer, directory_nick, &peer_handshake.nick, directory_onion, network, motd, false).await;
+                }
+                HandshakeError::DirectoryNotAccepted => {
+                    // Silent disconnect — directory nodes cannot register as peers.
+                    metrics::counter!("jm_handshakes_total", "result" => "directory_rejected").increment(1);
+                }
+                HandshakeError::MalformedNick => {
+                    // Silent disconnect.
+                    metrics::counter!("jm_handshakes_total", "result" => "malformed_nick").increment(1);
+                }
+                HandshakeError::TooManyFeatures(_) | HandshakeError::NestedFeatureValue(_) => {
+                    // Silent disconnect.
+                    metrics::counter!("jm_handshakes_total", "result" => "malformed_features").increment(1);
+                }
+                HandshakeError::JsonParse(_) => {
+                    // Already caught above during `parse_json`; unreachable here, but
+                    // listed so the compiler enforces exhaustiveness for any future
+                    // `HandshakeError` variants.
+                    metrics::counter!("jm_handshakes_total", "result" => "parse_error").increment(1);
+                }
             }
             return;
         }
@@ -271,10 +307,11 @@ pub async fn handle_peer(
         None
     };
 
-    // Per-peer broadcast rate limiting state
-    let mut pubmsg_timestamps: std::collections::VecDeque<Instant> = std::collections::VecDeque::new();
-    // Separate, tighter bucket for !orderbook messages.
-    let mut orderbook_timestamps: std::collections::VecDeque<Instant> = std::collections::VecDeque::new();
+    // Per-peer broadcast rate-limiting state (grouped to stay within clippy's arg limit).
+    let mut rate_limits = RateLimitState {
+        pubmsg_timestamps: std::collections::VecDeque::new(),
+        orderbook_timestamps: std::collections::VecDeque::new(),
+    };
 
     // Message loop
     let mut line = String::new();
@@ -298,8 +335,7 @@ pub async fn handle_peer(
                             &peer_onion,
                             router,
                             &mut writer,
-                            &mut pubmsg_timestamps,
-                            &mut orderbook_timestamps,
+                            &mut rate_limits,
                         ).await {
                             tracing::warn!(nick = %nick, error = %e, "Message handling error");
                             break;
@@ -444,8 +480,7 @@ async fn handle_message(
     peer_onion: &Option<OnionServiceAddr>,
     router: &Router,
     writer: &mut BufWriter<BoxWriter>,
-    pubmsg_timestamps: &mut std::collections::VecDeque<Instant>,
-    orderbook_timestamps: &mut std::collections::VecDeque<Instant>,
+    rate_limits: &mut RateLimitState,
 ) -> anyhow::Result<()> {
     if line.is_empty() {
         return Ok(());
@@ -495,30 +530,30 @@ async fn handle_message(
                 };
 
                 let is_orderbook = parsed_msg.as_ref()
-                    .map_or(false, |m| m.command == MessageCommand::Orderbook);
+                    .is_some_and(|m| m.command == MessageCommand::Orderbook);
 
                 if is_orderbook {
                     let cutoff = now - Duration::from_secs(60);
-                    while orderbook_timestamps.front().is_some_and(|&t| t < cutoff) {
-                        orderbook_timestamps.pop_front();
+                    while rate_limits.orderbook_timestamps.front().is_some_and(|&t| t < cutoff) {
+                        rate_limits.orderbook_timestamps.pop_front();
                     }
-                    if orderbook_timestamps.len() >= MAX_ORDERBOOK_PER_MINUTE {
+                    if rate_limits.orderbook_timestamps.len() >= MAX_ORDERBOOK_PER_MINUTE {
                         tracing::warn!(nick = %nick, "!orderbook rate limit exceeded — disconnecting");
                         metrics::counter!("jm_orderbook_rate_limit_disconnects_total").increment(1);
                         return Err(anyhow::anyhow!("!orderbook rate limit exceeded"));
                     }
-                    orderbook_timestamps.push_back(now);
+                    rate_limits.orderbook_timestamps.push_back(now);
                 } else {
                     let cutoff = now - Duration::from_secs(60);
-                    while pubmsg_timestamps.front().is_some_and(|&t| t < cutoff) {
-                        pubmsg_timestamps.pop_front();
+                    while rate_limits.pubmsg_timestamps.front().is_some_and(|&t| t < cutoff) {
+                        rate_limits.pubmsg_timestamps.pop_front();
                     }
-                    if pubmsg_timestamps.len() >= MAX_PUBMSG_PER_MINUTE {
+                    if rate_limits.pubmsg_timestamps.len() >= MAX_PUBMSG_PER_MINUTE {
                         tracing::warn!(nick = %nick, "Pubmsg rate limit exceeded — disconnecting");
                         metrics::counter!("jm_pubmsg_rate_limit_disconnects_total").increment(1);
                         return Err(anyhow::anyhow!("pubmsg broadcast rate limit exceeded"));
                     }
-                    pubmsg_timestamps.push_back(now);
+                    rate_limits.pubmsg_timestamps.push_back(now);
                 }
 
                 if let Some(msg) = parsed_msg {

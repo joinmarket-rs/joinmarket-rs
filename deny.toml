@@ -1,0 +1,62 @@
+# cargo-deny 0.19+ configuration for joinmarket-rs
+# Run: cargo deny check advisories bans licenses sources
+
+# ── Advisory policy ───────────────────────────────────────────────────────────
+# Vulnerabilities are hard errors by default in cargo-deny 0.19+.
+# Unmaintained/yanked/unsound advisories produce warnings by default.
+# The ignore list below silences arti-feature-only advisories that have no
+# available fix; each entry documents why the suppression is safe.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 — Marvin Attack in `rsa` crate.
+    # No fixed version available upstream. Affects arti feature only
+    # (embedded Tor backend). The default `tordaemon` build is NOT affected.
+    { id = "RUSTSEC-2023-0071", reason = "No fix available; arti-feature-only transitive dep. Default tordaemon build is unaffected." },
+
+    # RUSTSEC-2025-0141 — `bincode` crate unmaintained.
+    # Arti-only transitive dependency; no joinmarket-rs code uses bincode directly.
+    { id = "RUSTSEC-2025-0141", reason = "Arti-only transitive dep; no owned code uses bincode." },
+
+    # RUSTSEC-2024-0436 — `paste` crate unmaintained.
+    # Arti-only transitive dependency; no joinmarket-rs code uses paste directly.
+    { id = "RUSTSEC-2024-0436", reason = "Arti-only transitive dep; no owned code uses paste." },
+]
+
+# ── License policy ────────────────────────────────────────────────────────────
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unlicense",
+    "CC0-1.0",
+    "Zlib",
+]
+
+# ── Crate ban policy ─────────────────────────────────────────────────────────
+
+[bans]
+# Warn (not error) on duplicate crate versions — some are unavoidable due to
+# the hyper 0.14 / hyper 1.x split in metrics-exporter-prometheus 0.13.
+# See finding #17 in SECURITY_REMEDIATION_PLAN.md for the upgrade path.
+multiple-versions = "warn"
+# Wildcard version specs are banned; they make auditing impossible.
+# Path-only workspace-internal deps have no version field and are flagged as
+# wildcards by cargo-deny. These are intentional (workspace members); warn only.
+wildcards = "warn"
+highlight = "all"
+
+# ── Source policy ────────────────────────────────────────────────────────────
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

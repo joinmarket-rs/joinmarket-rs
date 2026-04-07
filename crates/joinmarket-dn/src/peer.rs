@@ -20,7 +20,12 @@ use crate::admission::AdmissionController;
 const MAX_LINE_LEN: usize = 40_000;
 const HANDSHAKE_TIMEOUT_SECS: u64 = 10;
 /// Maximum pubmsg broadcasts a single peer may send per 60-second window.
+/// Maker offer announcements (is_offer()) are exempt from this limit — see below.
 const MAX_PUBMSG_PER_MINUTE: usize = 30;
+/// Separate, tighter per-peer cap for `!orderbook` commands (taker → DN).
+/// The Python client sends one on connect and one after each coinjoin, so 3/min
+/// is already generous while preventing amplification attacks on makers.
+const MAX_ORDERBOOK_PER_MINUTE: usize = 3;
 
 /// Read a `\n`-terminated line from a buffered reader without allocating beyond
 /// `max_len` bytes. Returns `Ok(n)` where `n` is the number of bytes read
@@ -254,7 +259,7 @@ pub async fn handle_peer(
 
     // Register all per-peer metadata in a single insertion.
     let shutdown_token = CancellationToken::new();
-    router.register_peer_meta(&nick, shutdown_token.clone(), probe_tx, ping_capable);
+    router.register_peer_meta(&nick, shutdown_token.clone(), probe_tx, ping_capable, is_maker);
 
     // Subscribe to the all-peers broadcast channel.
     let mut broadcast_rx = router.subscribe();
@@ -269,6 +274,8 @@ pub async fn handle_peer(
 
     // Per-peer broadcast rate limiting state
     let mut pubmsg_timestamps: std::collections::VecDeque<Instant> = std::collections::VecDeque::new();
+    // Separate, tighter bucket for !orderbook messages.
+    let mut orderbook_timestamps: std::collections::VecDeque<Instant> = std::collections::VecDeque::new();
 
     // Message loop
     let mut line = String::new();
@@ -293,6 +300,7 @@ pub async fn handle_peer(
                             router,
                             &mut writer,
                             &mut pubmsg_timestamps,
+                            &mut orderbook_timestamps,
                         ).await {
                             tracing::warn!(nick = %nick, error = %e, "Message handling error");
                             break;
@@ -438,6 +446,7 @@ async fn handle_message(
     router: &Router,
     writer: &mut BufWriter<BoxWriter>,
     pubmsg_timestamps: &mut std::collections::VecDeque<Instant>,
+    orderbook_timestamps: &mut std::collections::VecDeque<Instant>,
 ) -> anyhow::Result<()> {
     if line.is_empty() {
         return Ok(());
@@ -467,22 +476,62 @@ async fn handle_message(
                     return Err(anyhow::anyhow!("pubmsg from_nick spoofing attempt"));
                 }
 
-                // Per-peer broadcast rate limit
-                let now = Instant::now();
-                let cutoff = now - Duration::from_secs(60);
-                while pubmsg_timestamps.front().is_some_and(|&t| t < cutoff) {
-                    pubmsg_timestamps.pop_front();
-                }
-                if pubmsg_timestamps.len() >= MAX_PUBMSG_PER_MINUTE {
-                    tracing::warn!(nick = %nick, "Pubmsg rate limit exceeded — disconnecting");
-                    metrics::counter!("jm_pubmsg_rate_limit_disconnects_total").increment(1);
-                    return Err(anyhow::anyhow!("pubmsg broadcast rate limit exceeded"));
-                }
-                pubmsg_timestamps.push_back(now);
+                // Parse the JM message first so we can apply command-aware
+                // rate limiting before deciding whether to dispatch.
+                let parsed_msg = match JmMessage::parse(body) {
+                    Ok(msg) => Some(msg),
+                    Err(e) => {
+                        tracing::debug!(nick = %nick, error = %e, "Ignoring invalid JM message in pubmsg");
+                        None
+                    }
+                };
 
-                match JmMessage::parse(body) {
-                    Ok(msg) => dispatch_pubmsg(msg, body, nick.clone(), is_maker, router, writer).await?,
-                    Err(e) => tracing::debug!(nick = %nick, error = %e, "Ignoring invalid JM message in pubmsg"),
+                // Rate-limiting strategy:
+                //
+                // 1. Maker offer announcements (is_offer()) are completely exempt.
+                //    Makers respond to every !orderbook broadcast; capping them
+                //    would cause legitimate makers to be evicted under load.
+                //
+                // 2. !orderbook uses its own tighter per-peer bucket so a taker
+                //    cannot use the full 30/min allowance to hammer makers.
+                //
+                // 3. All other pubmsgs (including invalid/unparseable ones)
+                //    count against the general 30/min bucket.
+                let is_offer_from_maker = is_maker
+                    && parsed_msg.as_ref().map_or(false, |m| m.command.is_offer());
+
+                if !is_offer_from_maker {
+                    let now = Instant::now();
+                    let is_orderbook = parsed_msg.as_ref()
+                        .map_or(false, |m| m.command == MessageCommand::Orderbook);
+
+                    if is_orderbook {
+                        let cutoff = now - Duration::from_secs(60);
+                        while orderbook_timestamps.front().is_some_and(|&t| t < cutoff) {
+                            orderbook_timestamps.pop_front();
+                        }
+                        if orderbook_timestamps.len() >= MAX_ORDERBOOK_PER_MINUTE {
+                            tracing::warn!(nick = %nick, "!orderbook rate limit exceeded — disconnecting");
+                            metrics::counter!("jm_orderbook_rate_limit_disconnects_total").increment(1);
+                            return Err(anyhow::anyhow!("!orderbook rate limit exceeded"));
+                        }
+                        orderbook_timestamps.push_back(now);
+                    } else {
+                        let cutoff = now - Duration::from_secs(60);
+                        while pubmsg_timestamps.front().is_some_and(|&t| t < cutoff) {
+                            pubmsg_timestamps.pop_front();
+                        }
+                        if pubmsg_timestamps.len() >= MAX_PUBMSG_PER_MINUTE {
+                            tracing::warn!(nick = %nick, "Pubmsg rate limit exceeded — disconnecting");
+                            metrics::counter!("jm_pubmsg_rate_limit_disconnects_total").increment(1);
+                            return Err(anyhow::anyhow!("pubmsg broadcast rate limit exceeded"));
+                        }
+                        pubmsg_timestamps.push_back(now);
+                    }
+                }
+
+                if let Some(msg) = parsed_msg {
+                    dispatch_pubmsg(msg, body, nick.clone(), is_maker, router, writer).await?;
                 }
             } else {
                 tracing::debug!(nick = %nick, "Ignoring malformed pubmsg line");
@@ -571,6 +620,11 @@ fn broadcast_pubmsg(nick: &Arc<str>, command: &MessageCommand, body: &str, route
     let broadcast_msg: Arc<str> = OnionEnvelope::new(msg_type::PUBMSG, pubmsg_line).serialize().into();
     if command.is_taker_only() {
         router.broadcast_to_takers(nick.as_ref(), broadcast_msg);
+    } else if *command == MessageCommand::Orderbook {
+        // Global throttle: silently drop if a forwarded !orderbook was sent
+        // too recently. This bounds maker response amplification regardless
+        // of how many takers send !orderbook simultaneously.
+        router.broadcast_orderbook(nick.as_ref(), broadcast_msg);
     } else {
         router.broadcast(nick.as_ref(), broadcast_msg);
     }
@@ -730,12 +784,16 @@ async fn dispatch_privmsg(
     let fwd_env = OnionEnvelope::new(msg_type::PRIVMSG, original_line);
     let fwd_bytes: Arc<str> = Arc::from(fwd_env.serialize().as_str());
     if !router.send_to_peer(to_nick, fwd_bytes) {
-        metrics::counter!("jm_router_locate_misses_total").increment(1);
-        tracing::debug!(
-            from = %from_nick,
-            target = %to_nick,
-            "Target peer not found for privmsg relay"
-        );
+        // Don't count messages directed at the DN's own nick as routing misses;
+        // these are expected privmsg replies to heartbeat !orderbook probes.
+        if to_nick != router.dn_nick() {
+            metrics::counter!("jm_router_locate_misses_total").increment(1);
+            tracing::debug!(
+                from = %from_nick,
+                target = %to_nick,
+                "Target peer not found for privmsg relay"
+            );
+        }
         return Ok(());
     }
     metrics::counter!("jm_router_locate_hits_total").increment(1);

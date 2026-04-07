@@ -1,17 +1,17 @@
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-use joinmarket_core::message::{OnionEnvelope, msg_type};
+use joinmarket_core::message::{OnionEnvelope, make_pubmsg_line, msg_type};
 use crate::router::Router;
 
 /// How often to sweep for idle peers.
-const IDLE_CHECK_INTERVAL_SECS: u64 = 300; // 5 min
+const IDLE_CHECK_INTERVAL_SECS: u64 = 60; // 1 min
 
-/// Peers idle longer than this receive a !ping probe (ping-capable peers only).
-const WRITE_PROBE_THRESHOLD_SECS: u64 = 300; // 5 min
+/// Peers idle longer than this receive a probe.
+const WRITE_PROBE_THRESHOLD_SECS: u64 = 600; // 10 min
 
 /// Peers idle longer than this are hard-evicted without a probe.
-const HARD_EVICT_THRESHOLD_SECS: u64 = 900; // 15 min
+const HARD_EVICT_THRESHOLD_SECS: u64 = 1500; // 25 min
 
 /// How long to wait for a !pong after sending !ping to a ping-capable peer.
 const PONG_TIMEOUT_SECS: u64 = 30;
@@ -41,9 +41,12 @@ pub async fn heartbeat_loop(router: Arc<Router>, shutdown: CancellationToken) {
                     }
                 }
 
-                // Step 2: Send !ping probes to ping-capable peers idle > 5 min.
-                // Non-ping peers (Python clients) receive no probe — they will be
-                // hard-evicted at 15 min if no message is received.
+                // Step 2: Probe idle peers (> 5 min) based on their capabilities:
+                //   - Ping-capable peers: send !ping and wait for !pong.
+                //   - Non-ping makers (Python clients): send a unicast !orderbook so
+                //     the maker re-announces its offers. When the DN receives those
+                //     offer pubmsgs it updates last_seen, keeping the maker alive.
+                //   - Non-ping takers: no probe. Hard-evicted at 15 min if silent.
                 let peers_to_probe = router.collect_peers_for_probe(
                     Duration::from_secs(WRITE_PROBE_THRESHOLD_SECS)
                 );
@@ -53,16 +56,27 @@ pub async fn heartbeat_loop(router: Arc<Router>, shutdown: CancellationToken) {
                 }
 
                 let ping_frame = build_ping_frame();
+                let dn_nick = router.dn_nick();
+                let orderbook_frame = build_orderbook_probe_frame(&dn_nick);
                 let mut ping_sent = false;
 
-                for (nick, supports_ping) in &peers_to_probe {
-                    if *supports_ping && router.send_to_peer(nick, ping_frame.clone()) {
-                        router.add_pong_pending(nick);
-                        ping_sent = true;
-                        tracing::debug!(%nick, "Sent !ping probe");
+                for (nick, supports_ping, is_maker) in &peers_to_probe {
+                    if *supports_ping {
+                        if router.send_to_peer(nick, ping_frame.clone()) {
+                            router.add_pong_pending(nick);
+                            ping_sent = true;
+                            metrics::counter!("jm_heartbeat_ping_probes_total").increment(1);
+                            tracing::debug!(%nick, "Sent !ping probe");
+                        }
+                    } else if *is_maker {
+                        // Non-ping maker: unicast !orderbook to elicit an offer
+                        // re-announcement, which will refresh last_seen when received.
+                        if router.send_to_peer(nick, orderbook_frame.clone()) {
+                            metrics::counter!("jm_heartbeat_orderbook_probes_total").increment(1);
+                            tracing::debug!(%nick, "Sent !orderbook probe to non-ping maker");
+                        }
                     }
-                    // Non-ping peers: no probe. They will be hard-evicted at 15 min
-                    // if no message is received.
+                    // Non-ping takers: no probe. Hard-evicted at 15 min if silent.
                 }
 
                 // Step 3: If !pings were sent, wait then evict non-responders.
@@ -92,4 +106,12 @@ pub async fn heartbeat_loop(router: Arc<Router>, shutdown: CancellationToken) {
 /// Build a PING envelope.
 fn build_ping_frame() -> Arc<str> {
     Arc::from(OnionEnvelope::new(msg_type::PING, "").serialize())
+}
+
+/// Build a unicast !orderbook PUBMSG envelope addressed from the DN's own nick.
+/// Sent to non-ping makers as a liveness probe: the maker will respond with its
+/// offers as pubmsgs, which update `last_seen` when received by the DN.
+fn build_orderbook_probe_frame(dn_nick: &str) -> Arc<str> {
+    let line = make_pubmsg_line(dn_nick, "!orderbook");
+    Arc::from(OnionEnvelope::new(msg_type::PUBMSG, line).serialize())
 }

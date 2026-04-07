@@ -13,9 +13,13 @@ const SHARD_COUNT: usize = 64;
 /// All-peers channel: carries only low-frequency messages (`!orderbook`, `!hp2`,
 /// disconnect notifications). 256 slots is ample for this traffic.
 const BROADCAST_CAPACITY_ALL: usize = 256;
-/// Takers-only channel: absorbs peak `!orderbook` burst traffic — up to ~5 000
-/// simultaneous maker offer responses per event, with headroom for two
-/// concurrent bursts from different takers (2 × 5 000 = 10 000 < 16 384).
+/// Minimum time between consecutive forwarded `!orderbook` broadcasts.
+/// Regardless of how many takers send `!orderbook` simultaneously, the DN
+/// forwards at most one every 10 seconds, bounding maker response amplification.
+const ORDERBOOK_BROADCAST_INTERVAL: Duration = Duration::from_secs(10);
+/// Takers-only channel: carries low-frequency offer startup announcements,
+/// offer-list updates, !cancel, and !tbond. 256 slots matches the all-peers
+/// channel; !orderbook responses are privmsgs and never enter this ring.
 const BROADCAST_CAPACITY_TAKERS: usize = 256;
 const MAX_MAKERS_BEFORE_SAMPLE: usize = 20_000;
 const SAMPLE_TARGET: usize = 4_000;
@@ -123,6 +127,8 @@ pub struct Router {
     dn_nick: Mutex<String>,
     /// Directory node's own location-string, e.g. "xxxx.onion:5222".
     dn_location: Mutex<String>,
+    /// Timestamp of the last forwarded `!orderbook` broadcast (global throttle).
+    last_orderbook_broadcast: Mutex<Option<Instant>>,
 }
 
 impl Default for Router {
@@ -143,6 +149,7 @@ impl Router {
             peer_meta: DashMap::new(),
             dn_nick: Mutex::new(String::new()),
             dn_location: Mutex::new(String::new()),
+            last_orderbook_broadcast: Mutex::new(None),
         }
     }
 
@@ -338,9 +345,27 @@ impl Router {
         }
     }
 
+    /// Broadcast an `!orderbook` message to all peers, subject to a global
+    /// minimum interval (`ORDERBOOK_BROADCAST_INTERVAL`). If an `!orderbook`
+    /// was forwarded too recently the message is silently dropped and the
+    /// `jm_orderbook_throttled_total` counter is incremented.
+    pub fn broadcast_orderbook(&self, sender_nick: &str, msg: Arc<str>) {
+        let mut last = self.last_orderbook_broadcast.lock();
+        let now = Instant::now();
+        if let Some(prev) = *last {
+            if now.duration_since(prev) < ORDERBOOK_BROADCAST_INTERVAL {
+                metrics::counter!("jm_orderbook_throttled_total").increment(1);
+                return;
+            }
+        }
+        *last = Some(now);
+        drop(last);
+        self.broadcast(sender_nick, msg);
+    }
+
     /// Broadcast to all connected peers (makers and takers).
-    /// Use for `!orderbook`, `!hp2`, disconnect notifications, and any message
-    /// that makers must receive.
+    /// Use for `!hp2`, disconnect notifications, and any message that makers
+    /// must receive. For `!orderbook` use `broadcast_orderbook` instead.
     pub fn broadcast(&self, sender_nick: &str, msg: Arc<str>) {
         let _ = self.broadcast_tx.send(BroadcastMsg {
             sender_nick: Arc::from(sender_nick),

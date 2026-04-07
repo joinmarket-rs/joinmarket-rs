@@ -714,18 +714,21 @@ Atomically reserves a slot via `fetch_add`; rolls back all prior layers on failu
 
 ### `heartbeat.rs`
 
-Three-step liveness sweep every 5 minutes. Clears zombie connections that TCP keepalive alone cannot detect (Tor circuits can be silently dropped).
+Three-step liveness sweep every minute. Clears zombie connections that TCP keepalive alone cannot detect (Tor circuits can be silently dropped).
 
 **Timing constants:**
-- Idle check interval: **300 seconds** (5 min)
-- Write probe threshold: **300 seconds** (5 min idle)
-- Hard evict threshold: **900 seconds** (15 min idle)
+- Idle check interval: **60 seconds** (1 min)
+- Write probe threshold: **600 seconds** (10 min idle)
+- Hard evict threshold: **1500 seconds** (25 min idle)
 - Pong timeout: **30 seconds**
 
 **Algorithm (each sweep):**
-1. **Hard-evict** peers idle >15 min (no probe — they are assumed dead)
-2. **Send PING** (envelope type 797) to ping-capable peers idle >5 min. Python JoinMarket clients do not support ping, so they are never probed (they rely on natural message activity to avoid hard eviction).
-3. **Wait 30 seconds**, then evict peers that did not respond with PONG (type 799)
+1. **Hard-evict** peers idle >25 min (no probe — they are assumed dead)
+2. **Probe** peers idle >10 min, branching on capability:
+   - **Ping-capable peers**: send PING (envelope type 797); wait 30 s; evict non-responders.
+   - **Non-ping makers** (Python JoinMarket clients): send a unicast `!orderbook` PUBMSG. The maker responds with offer privmsgs which flow through the normal receive path, updating `last_seen`. No explicit timeout — hard eviction at 25 min covers non-responders.
+   - **Non-ping takers**: no probe; hard-evicted at 25 min if silent.
+3. **Wait 30 seconds**, then evict ping-capable peers that did not respond with PONG (type 799)
 
 ```rust
 pub async fn heartbeat_loop(router: Arc<Router>, shutdown: CancellationToken) {
@@ -763,6 +766,8 @@ jm_admission_maker_cap_rejections_total    counter  # Layer 4
 
 # Heartbeat
 jm_heartbeat_evictions_total               counter
+jm_heartbeat_ping_probes_total             counter  # !ping probes sent to ping-capable peers
+jm_heartbeat_orderbook_probes_total        counter  # !orderbook probes sent to non-ping makers
 
 # Broadcast channels (label distinguishes all-peers vs takers-only)
 jm_messages_broadcast_total{channel="all|takers"}         counter

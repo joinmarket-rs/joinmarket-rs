@@ -20,7 +20,6 @@ use crate::admission::AdmissionController;
 const MAX_LINE_LEN: usize = 40_000;
 const HANDSHAKE_TIMEOUT_SECS: u64 = 10;
 /// Maximum pubmsg broadcasts a single peer may send per 60-second window.
-/// Maker offer announcements (is_offer()) are exempt from this limit — see below.
 const MAX_PUBMSG_PER_MINUTE: usize = 30;
 /// Separate, tighter per-peer cap for `!orderbook` commands (taker → DN).
 /// The Python client sends one on connect and one after each coinjoin, so 3/min
@@ -476,8 +475,17 @@ async fn handle_message(
                     return Err(anyhow::anyhow!("pubmsg from_nick spoofing attempt"));
                 }
 
-                // Parse the JM message first so we can apply command-aware
-                // rate limiting before deciding whether to dispatch.
+                // Rate-limiting strategy:
+                //
+                // 1. !orderbook uses its own tighter per-peer bucket (3/min) so
+                //    a taker cannot use the full 30/min allowance to hammer makers.
+                //
+                // 2. All other pubmsgs (including invalid/unparseable ones)
+                //    count against the general 30/min bucket.
+                let now = Instant::now();
+
+                // Parse the JM message so we can identify !orderbook before
+                // choosing which rate-limit bucket to apply.
                 let parsed_msg = match JmMessage::parse(body) {
                     Ok(msg) => Some(msg),
                     Err(e) => {
@@ -486,48 +494,31 @@ async fn handle_message(
                     }
                 };
 
-                // Rate-limiting strategy:
-                //
-                // 1. Maker offer announcements (is_offer()) are completely exempt.
-                //    Makers respond to every !orderbook broadcast; capping them
-                //    would cause legitimate makers to be evicted under load.
-                //
-                // 2. !orderbook uses its own tighter per-peer bucket so a taker
-                //    cannot use the full 30/min allowance to hammer makers.
-                //
-                // 3. All other pubmsgs (including invalid/unparseable ones)
-                //    count against the general 30/min bucket.
-                let is_offer_from_maker = is_maker
-                    && parsed_msg.as_ref().map_or(false, |m| m.command.is_offer());
+                let is_orderbook = parsed_msg.as_ref()
+                    .map_or(false, |m| m.command == MessageCommand::Orderbook);
 
-                if !is_offer_from_maker {
-                    let now = Instant::now();
-                    let is_orderbook = parsed_msg.as_ref()
-                        .map_or(false, |m| m.command == MessageCommand::Orderbook);
-
-                    if is_orderbook {
-                        let cutoff = now - Duration::from_secs(60);
-                        while orderbook_timestamps.front().is_some_and(|&t| t < cutoff) {
-                            orderbook_timestamps.pop_front();
-                        }
-                        if orderbook_timestamps.len() >= MAX_ORDERBOOK_PER_MINUTE {
-                            tracing::warn!(nick = %nick, "!orderbook rate limit exceeded — disconnecting");
-                            metrics::counter!("jm_orderbook_rate_limit_disconnects_total").increment(1);
-                            return Err(anyhow::anyhow!("!orderbook rate limit exceeded"));
-                        }
-                        orderbook_timestamps.push_back(now);
-                    } else {
-                        let cutoff = now - Duration::from_secs(60);
-                        while pubmsg_timestamps.front().is_some_and(|&t| t < cutoff) {
-                            pubmsg_timestamps.pop_front();
-                        }
-                        if pubmsg_timestamps.len() >= MAX_PUBMSG_PER_MINUTE {
-                            tracing::warn!(nick = %nick, "Pubmsg rate limit exceeded — disconnecting");
-                            metrics::counter!("jm_pubmsg_rate_limit_disconnects_total").increment(1);
-                            return Err(anyhow::anyhow!("pubmsg broadcast rate limit exceeded"));
-                        }
-                        pubmsg_timestamps.push_back(now);
+                if is_orderbook {
+                    let cutoff = now - Duration::from_secs(60);
+                    while orderbook_timestamps.front().is_some_and(|&t| t < cutoff) {
+                        orderbook_timestamps.pop_front();
                     }
+                    if orderbook_timestamps.len() >= MAX_ORDERBOOK_PER_MINUTE {
+                        tracing::warn!(nick = %nick, "!orderbook rate limit exceeded — disconnecting");
+                        metrics::counter!("jm_orderbook_rate_limit_disconnects_total").increment(1);
+                        return Err(anyhow::anyhow!("!orderbook rate limit exceeded"));
+                    }
+                    orderbook_timestamps.push_back(now);
+                } else {
+                    let cutoff = now - Duration::from_secs(60);
+                    while pubmsg_timestamps.front().is_some_and(|&t| t < cutoff) {
+                        pubmsg_timestamps.pop_front();
+                    }
+                    if pubmsg_timestamps.len() >= MAX_PUBMSG_PER_MINUTE {
+                        tracing::warn!(nick = %nick, "Pubmsg rate limit exceeded — disconnecting");
+                        metrics::counter!("jm_pubmsg_rate_limit_disconnects_total").increment(1);
+                        return Err(anyhow::anyhow!("pubmsg broadcast rate limit exceeded"));
+                    }
+                    pubmsg_timestamps.push_back(now);
                 }
 
                 if let Some(msg) = parsed_msg {
@@ -620,11 +611,6 @@ fn broadcast_pubmsg(nick: &Arc<str>, command: &MessageCommand, body: &str, route
     let broadcast_msg: Arc<str> = OnionEnvelope::new(msg_type::PUBMSG, pubmsg_line).serialize().into();
     if command.is_taker_only() {
         router.broadcast_to_takers(nick.as_ref(), broadcast_msg);
-    } else if *command == MessageCommand::Orderbook {
-        // Global throttle: silently drop if a forwarded !orderbook was sent
-        // too recently. This bounds maker response amplification regardless
-        // of how many takers send !orderbook simultaneously.
-        router.broadcast_orderbook(nick.as_ref(), broadcast_msg);
     } else {
         router.broadcast(nick.as_ref(), broadcast_msg);
     }

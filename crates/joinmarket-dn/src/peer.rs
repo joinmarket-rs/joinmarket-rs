@@ -508,8 +508,8 @@ async fn handle_message(
                     rate_limits.pubmsg_timestamps.push_back(now);
                 }
 
-                if let Some(msg) = parsed_msg {
-                    dispatch_pubmsg(msg, body, nick.clone(), router, writer).await?;
+                if parsed_msg.is_some() {
+                    dispatch_pubmsg(body, nick.clone(), router, writer).await?;
                 }
             } else {
                 tracing::debug!(nick = %nick, "Ignoring malformed pubmsg line");
@@ -572,7 +572,6 @@ async fn handle_message(
 }
 
 async fn dispatch_pubmsg(
-    msg: JmMessage,
     body: &str,
     nick: Arc<str>,
     router: &Router,

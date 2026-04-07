@@ -3,11 +3,6 @@ use serde::{Deserialize, Serialize};
 
 pub const CURRENT_PROTO_VER: u8 = 5;
 
-/// Channel ID used when verifying nick signatures in the onion transport.
-/// Matches the Python JoinMarket `hostid` for the onion message channel
-/// (`onionmc.py`: `self.hostid = "onion-network"`).
-pub const NICK_SIG_CHANNEL_ID: &str = "onion-network";
-
 // ── Onion channel handshake types (wire-compatible with Python JoinMarket) ───
 
 /// Inbound peer handshake (type=793).  The peer sends this first; the directory
@@ -25,11 +20,6 @@ pub struct PeerHandshake {
     pub features: HashMap<String, serde_json::Value>,
     pub nick: String,
     pub network: String,
-    /// Optional recoverable ECDSA nick-ownership proof (base64, 65 bytes).
-    /// If present, `validate()` verifies it; if absent, the peer is accepted
-    /// in lenient mode (no Python client sends this yet).
-    #[serde(rename = "nick-sig", default, skip_serializing_if = "Option::is_none")]
-    pub nick_sig: Option<String>,
 }
 
 /// Maximum number of entries allowed in the handshake `features` map.
@@ -93,15 +83,8 @@ impl PeerHandshake {
                 got: self.network.clone(),
             });
         }
-        let nick_obj = crate::nick::Nick::from_str(&self.nick)
+        crate::nick::Nick::from_str(&self.nick)
             .map_err(|_| HandshakeError::MalformedNick)?;
-        if let Some(sig_b64) = &self.nick_sig {
-            let sig = crate::nick::NickSig::from_base64(sig_b64)
-                .map_err(|_| HandshakeError::NickSigInvalid)?;
-            if !nick_obj.verify_signature(self.nick.as_bytes(), NICK_SIG_CHANNEL_ID, &sig) {
-                return Err(HandshakeError::NickSigInvalid);
-            }
-        }
         if !self.location_string.is_empty()
             && self.location_string != crate::message::NOT_SERVING_ONION
         {
@@ -152,8 +135,6 @@ pub enum HandshakeError {
     DirectoryNotAccepted,
     #[error("malformed nick")]
     MalformedNick,
-    #[error("nick signature verification failed")]
-    NickSigInvalid,
     #[error("too many features entries: {0} (max {})", MAX_FEATURES_ENTRIES)]
     TooManyFeatures(usize),
     #[error("nested value not allowed in features key '{0}'")]
@@ -250,80 +231,4 @@ mod tests {
         assert!(msg.fidelity_bond().is_none());
     }
 
-    /// Helper: produce a valid (nick, nick_sig_b64) pair for use in handshake tests.
-    fn make_nick_with_sig() -> (String, String) {
-        use crate::nick::{Nick, Network};
-        let (nick, key) = Nick::generate(Network::Mainnet);
-        let sig = key.sign_message(nick.as_str().as_bytes(), NICK_SIG_CHANNEL_ID);
-        (nick.as_str().to_string(), sig.to_base64())
-    }
-
-    #[test]
-    fn test_validate_no_nick_sig_is_accepted_lenient() {
-        // No nick-sig field — current Python clients never send one.
-        // The DN must accept these peers (lenient mode).
-        let msg = PeerHandshake::parse_json(valid_handshake_json()).unwrap();
-        assert!(msg.nick_sig.is_none());
-        assert!(msg.validate("mainnet").is_ok());
-    }
-
-    #[test]
-    fn test_validate_valid_nick_sig_accepted() {
-        let (nick, sig_b64) = make_nick_with_sig();
-        let json = format!(
-            "{{\"app-name\":\"joinmarket\",\"directory\":false,\"location-string\":\"\",\"proto-ver\":5,\"features\":{{}},\"nick\":\"{nick}\",\"network\":\"mainnet\",\"nick-sig\":\"{sig_b64}\"}}"
-        );
-        let msg = PeerHandshake::parse_json(&json).unwrap();
-        assert!(msg.nick_sig.is_some());
-        assert!(msg.validate("mainnet").is_ok());
-    }
-
-    #[test]
-    fn test_validate_invalid_nick_sig_rejected() {
-        let (nick, _) = make_nick_with_sig();
-        // Use a different key's signature — won't match this nick's pubkey hash.
-        let (_, other_key) = crate::nick::Nick::generate(crate::nick::Network::Mainnet);
-        let bad_sig = other_key.sign_message(nick.as_bytes(), NICK_SIG_CHANNEL_ID);
-        let bad_sig_b64 = bad_sig.to_base64();
-        let json = format!(
-            "{{\"app-name\":\"joinmarket\",\"directory\":false,\"location-string\":\"\",\"proto-ver\":5,\"features\":{{}},\"nick\":\"{nick}\",\"network\":\"mainnet\",\"nick-sig\":\"{bad_sig_b64}\"}}"
-        );
-        let msg = PeerHandshake::parse_json(&json).unwrap();
-        let err = msg.validate("mainnet").unwrap_err();
-        assert!(matches!(err, HandshakeError::NickSigInvalid));
-    }
-
-    #[test]
-    fn test_validate_malformed_nick_sig_rejected() {
-        let (nick, _) = make_nick_with_sig();
-        let json = format!(
-            "{{\"app-name\":\"joinmarket\",\"directory\":false,\"location-string\":\"\",\"proto-ver\":5,\"features\":{{}},\"nick\":\"{nick}\",\"network\":\"mainnet\",\"nick-sig\":\"not-valid-base64!!!\"}}"
-        );
-        let msg = PeerHandshake::parse_json(&json).unwrap();
-        let err = msg.validate("mainnet").unwrap_err();
-        assert!(matches!(err, HandshakeError::NickSigInvalid));
-    }
-
-    #[test]
-    fn test_validate_nick_sig_wrong_channel_id_rejected() {
-        // Sign with the wrong channel_id — must not verify.
-        let (nick, key) = crate::nick::Nick::generate(crate::nick::Network::Mainnet);
-        let wrong_sig = key.sign_message(nick.as_str().as_bytes(), "wrong-channel");
-        let wrong_sig_b64 = wrong_sig.to_base64();
-        let nick_str = nick.as_str();
-        let json = format!(
-            "{{\"app-name\":\"joinmarket\",\"directory\":false,\"location-string\":\"\",\"proto-ver\":5,\"features\":{{}},\"nick\":\"{nick_str}\",\"network\":\"mainnet\",\"nick-sig\":\"{wrong_sig_b64}\"}}"
-        );
-        let msg = PeerHandshake::parse_json(&json).unwrap();
-        let err = msg.validate("mainnet").unwrap_err();
-        assert!(matches!(err, HandshakeError::NickSigInvalid));
-    }
-    #[test]
-    fn test_nick_sig_not_serialized_when_none() {
-        // nick_sig = None should not appear in the serialized JSON.
-        let msg = PeerHandshake::parse_json(valid_handshake_json()).unwrap();
-        assert!(msg.nick_sig.is_none());
-        let serialized = msg.to_json();
-        assert!(!serialized.contains("nick-sig"));
-    }
 }

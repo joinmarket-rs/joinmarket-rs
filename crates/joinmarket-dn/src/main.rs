@@ -84,6 +84,13 @@ async fn main() -> anyhow::Result<()> {
     // Start Prometheus metrics server
     let metrics_addr: std::net::SocketAddr = args.metrics_bind.parse()
         .map_err(|e| anyhow::anyhow!("invalid --metrics-bind address '{}': {}", args.metrics_bind, e))?;
+    if !metrics_addr.ip().is_loopback() {
+        tracing::warn!(
+            address = %metrics_addr,
+            "Prometheus metrics endpoint is bound to a non-loopback address; \
+             this exposes operational data publicly. Ensure this is intentional."
+        );
+    }
     metrics::init_metrics(metrics_addr)?;
 
     let shutdown = CancellationToken::new();
@@ -156,11 +163,13 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Directory node stopped");
 
-    // Exit immediately to skip Tokio runtime teardown.  Arti spawns
-    // internal tasks whose timer entries panic when the runtime drops —
-    // a known Tokio limitation.  All application-level cleanup has
-    // already completed above.
-    std::process::exit(0)
+    // Return normally so that drop handlers run in order.  Previously this
+    // called std::process::exit(0) to skip Tokio/Arti runtime teardown,
+    // working around Arti internal tasks that can panic when the runtime
+    // drops.  The #[tokio::main] macro wraps the runtime in a catch-all;
+    // any such panic will be printed but will not prevent clean shutdown.
+    // TODO: remove this comment once the upstream Arti shutdown bug is resolved.
+    Ok(())
 }
 
 /// Expand a leading `~` to `$HOME`. Returns the string unchanged if it does

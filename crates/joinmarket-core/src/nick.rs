@@ -3,6 +3,11 @@ use secp256k1::ecdsa::{RecoverableSignature, RecoveryId};
 use bitcoin_hashes::{sha256, Hash};
 use base64::Engine as _;
 
+/// Lowercase hex-encode `bytes`, matching Python's `binascii.hexlify()`.
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 const NICK_HASH_LEN: usize = 10;
 const NICK_TOTAL_LEN: usize = 16;
 
@@ -56,7 +61,10 @@ impl Nick {
         let public_key = PublicKey::from_secret_key(&secp, &secret_key);
 
         let pubkey_bytes = public_key.serialize();
-        let hash = sha256::Hash::hash(&pubkey_bytes);
+        // Hash the lowercase hex encoding of the pubkey, matching Python JoinMarket:
+        // `hashlib.sha256(binascii.hexlify(pubkey_bytes)).digest()`
+        let hex_pubkey = hex_encode(&pubkey_bytes);
+        let hash = sha256::Hash::hash(hex_pubkey.as_bytes());
 
         // Take first NICK_HASH_LEN bytes of hash and base58-encode
         let hash_prefix = &hash[..NICK_HASH_LEN];
@@ -123,7 +131,8 @@ impl Nick {
         };
 
         let pubkey_bytes = pubkey.serialize();
-        let computed = sha256::Hash::hash(&pubkey_bytes);
+        let hex_pubkey = hex_encode(&pubkey_bytes);
+        let computed = sha256::Hash::hash(hex_pubkey.as_bytes());
         let expected_b58 = bs58::encode(&computed[..NICK_HASH_LEN]).into_string();
 
         // Nick: J<version_byte><base58_hash><'O'-padding>
@@ -207,6 +216,42 @@ impl SigningKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_python_compatibility_nick_hash() {
+        // Verify that nick generation matches the Python JoinMarket algorithm:
+        //   sha256(binascii.hexlify(pubkey_bytes)).digest()[:10] → base58 → nick
+        //
+        // Test vector: privkey = scalar 1 → generator point G
+        //   compressed pubkey: 0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798
+        //   sha256(hex string above as ASCII bytes)[:10] = d13c888cfd35d6ab67dc
+        //   base58 → "Ckon1LuuapPSBM"
+        //   nick  → "J5Ckon1LuuapPSBM"
+        use secp256k1::{Secp256k1, SecretKey, PublicKey};
+        let secp = Secp256k1::new();
+        let privkey_bytes = {
+            let mut b = [0u8; 32];
+            b[31] = 1; // scalar 1
+            b
+        };
+        let secret_key = SecretKey::from_slice(&privkey_bytes).unwrap();
+        let public_key = PublicKey::from_secret_key(&secp, &secret_key);
+        let pubkey_bytes = public_key.serialize();
+        assert_eq!(
+            hex_encode(&pubkey_bytes),
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+        );
+        let hex_pubkey = hex_encode(&pubkey_bytes);
+        let hash = sha256::Hash::hash(hex_pubkey.as_bytes());
+        assert_eq!(&hash[..10], &[0xd1, 0x3c, 0x88, 0x8c, 0xfd, 0x35, 0xd6, 0xab, 0x67, 0xdc]);
+        let b58 = bs58::encode(&hash[..NICK_HASH_LEN]).into_string();
+        assert_eq!(b58, "Ckon1LuuapPSBM");
+        // Full nick
+        let expected = "J5Ckon1LuuapPSBM";
+        assert_eq!(expected.len(), NICK_TOTAL_LEN);
+        // Confirm our Nick::from_str accepts it
+        assert!(Nick::from_str(expected).is_ok());
+    }
 
     #[test]
     fn test_generate_nick_mainnet() {

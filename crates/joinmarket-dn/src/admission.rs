@@ -1,4 +1,6 @@
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU32, Ordering};
+use parking_lot::Mutex;
 use joinmarket_core::onion::OnionServiceAddr;
 use joinmarket_core::fidelity_bond::FidelityBondProof;
 
@@ -10,6 +12,8 @@ const MAX_CONCURRENT_PEERS: u32 = 100_000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AdmissionError {
+    #[error("nick already connected: {0}")]
+    DuplicateNick(String),
     #[error("sybil guard rejected: {0}")]
     Sybil(#[from] SybilError),
     #[error("bond UTXO duplicate: {0}")]
@@ -19,6 +23,11 @@ pub enum AdmissionError {
 }
 
 pub struct AdmissionController {
+    /// Mutex-protected set of currently-admitted nicks. Checked and updated
+    /// as the very first step of `admit_peer` to atomically prevent two
+    /// concurrent tasks from racing through the multi-step admission pipeline
+    /// with the same nick.
+    admitted_nicks: Mutex<HashSet<String>>,
     sybil_guard: SybilGuard,
     bond_registry: FidelityBondRegistry,
     peer_count: AtomicU32,
@@ -33,6 +42,7 @@ impl Default for AdmissionController {
 impl AdmissionController {
     pub fn new() -> Self {
         AdmissionController {
+            admitted_nicks: Mutex::new(HashSet::new()),
             sybil_guard: SybilGuard::new(),
             bond_registry: FidelityBondRegistry::new(),
             peer_count: AtomicU32::new(0),
@@ -46,8 +56,21 @@ impl AdmissionController {
         onion_addr: &OnionServiceAddr,
         bond: Option<&FidelityBondProof>,
     ) -> Result<(), AdmissionError> {
+        // Layer 1: Nick uniqueness — atomically reserve the nick before any
+        // subsequent checks so that two concurrent tasks for the same nick
+        // cannot both pass the multi-step pipeline simultaneously.
+        {
+            let mut admitted = self.admitted_nicks.lock();
+            if admitted.contains(nick) {
+                metrics::counter!("jm_admission_duplicate_nick_total").increment(1);
+                return Err(AdmissionError::DuplicateNick(nick.to_string()));
+            }
+            admitted.insert(nick.to_string());
+        } // lock released before heavier checks
+
         // Layer 2: Sybil guard
         self.sybil_guard.register(nick, &onion_addr.host).map_err(|e| {
+            self.admitted_nicks.lock().remove(nick);
             metrics::counter!("jm_admission_sybil_rejections_total").increment(1);
             AdmissionError::Sybil(e)
         })?;
@@ -56,6 +79,7 @@ impl AdmissionController {
         if let Some(b) = bond {
             if let Err(e) = self.bond_registry.register_bond(nick, b) {
                 self.sybil_guard.deregister(nick);
+                self.admitted_nicks.lock().remove(nick);
                 metrics::counter!("jm_admission_bond_dup_rejections_total").increment(1);
                 return Err(AdmissionError::BondDuplicate(e));
             }
@@ -70,6 +94,7 @@ impl AdmissionController {
             if bond.is_some() {
                 self.bond_registry.deregister_nick(nick);
             }
+            self.admitted_nicks.lock().remove(nick);
             metrics::counter!("jm_admission_peer_cap_rejections_total").increment(1);
             return Err(AdmissionError::PeerCapacity(prev));
         }
@@ -81,6 +106,7 @@ impl AdmissionController {
         self.sybil_guard.deregister(nick);
         self.bond_registry.deregister_nick(nick);
         self.peer_count.fetch_sub(1, Ordering::AcqRel);
+        self.admitted_nicks.lock().remove(nick);
     }
 }
 
@@ -107,6 +133,27 @@ mod tests {
         let onion = make_onion_addr();
         assert!(ac.admit_peer("J5nickAAAAAAAA0", &onion, None).is_ok());
         assert_eq!(ac.peer_count.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn test_duplicate_nick_rejected() {
+        let ac = AdmissionController::new();
+        let onion = make_onion_addr();
+        ac.admit_peer("J5nickAAAAAAAA0", &onion, None).unwrap();
+        // Second admission with same nick must fail even from a different onion
+        let onion2 = make_onion_addr2();
+        let err = ac.admit_peer("J5nickAAAAAAAA0", &onion2, None).unwrap_err();
+        assert!(matches!(err, AdmissionError::DuplicateNick(_)));
+    }
+
+    #[test]
+    fn test_duplicate_nick_released_allows_readmit() {
+        let ac = AdmissionController::new();
+        let onion = make_onion_addr();
+        ac.admit_peer("J5nickAAAAAAAA0", &onion, None).unwrap();
+        ac.release_peer("J5nickAAAAAAAA0");
+        // After release the nick slot is free again
+        assert!(ac.admit_peer("J5nickAAAAAAAA0", &onion, None).is_ok());
     }
 
     #[test]

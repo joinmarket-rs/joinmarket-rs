@@ -264,6 +264,21 @@ cargo deny check advisories bans licenses sources
 cargo audit
 ```
 
+### `cargo semver-checks`
+
+The workspace crates are not published on crates.io, but `cargo semver-checks` works
+against git tags via `--baseline-rev`. Check each library crate individually:
+
+```bash
+cargo semver-checks -p joinmarket-core --baseline-rev v0.1.0-alpha
+```
+
+- **Do not run at the workspace level** — `joinmarket-tor` has mutually exclusive
+  `arti`/`tordaemon` features that the tool tries to enable simultaneously.
+- `joinmarket-dn` is a binary crate; semver checks do not apply.
+- `joinmarket-core` currently has **4 major semver violations** relative to `v0.1.0-alpha`
+  (removed `MessageCommand` enum variants). Bump to `0.2.0` before the next release.
+
 ### `cargo deny` (v0.19+) — `deny.toml`
 
 - **`[advisories]`** only accepts `ignore = [...]`. The old `vulnerability`, `unmaintained`,
@@ -275,6 +290,18 @@ cargo audit
   otherwise `cargo deny check licenses` errors on them as unlicensed.
 - **Arti-only advisories** are suppressed in `deny.toml` with documented reasons. Do not
   remove those entries without confirming the upstream fix is available.
+
+### Nick signature protocol (`nick-sig` handshake field)
+
+- `PeerHandshake` has an optional `"nick-sig"` JSON field (base64 recoverable ECDSA, 65 bytes).
+- If present, it is verified in `PeerHandshake::validate()` via `Nick::verify_signature()`:
+  - **Message**: the nick string as bytes (`nick.as_bytes()`)
+  - **Channel ID**: `"onion-network"` (matches Python JoinMarket `hostid` in `onionmc.py`)
+  - **Hash**: `sha256(channel_id || message)`
+- If present but invalid → `HandshakeError::NickSigInvalid` → silent disconnect + `jm_invalid_nick_sig_total` counter.
+- If absent → accepted (lenient mode — no Python client sends this yet) + `jm_missing_nick_sig_total` counter.
+- To flip to strict mode when Python clients are updated: return `HandshakeError::NickSigInvalid` when `nick_sig.is_none()`.
+- The channel ID constant is `NICK_SIG_CHANNEL_ID` in `handshake.rs`.
 
 ### `secp256k1` version notes
 

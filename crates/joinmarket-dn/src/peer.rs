@@ -222,6 +222,12 @@ pub async fn handle_peer(
                     // Silent disconnect.
                     metrics::counter!("jm_handshakes_total", "result" => "malformed_nick").increment(1);
                 }
+                HandshakeError::NickSigInvalid => {
+                    // Silent disconnect — a present-but-invalid nick sig is an
+                    // active spoofing attempt; send no response.
+                    metrics::counter!("jm_handshakes_total", "result" => "invalid_nick_sig").increment(1);
+                    metrics::counter!("jm_invalid_nick_sig_total").increment(1);
+                }
                 HandshakeError::TooManyFeatures(_) | HandshakeError::NestedFeatureValue(_) => {
                     // Silent disconnect.
                     metrics::counter!("jm_handshakes_total", "result" => "malformed_features").increment(1);
@@ -236,6 +242,11 @@ pub async fn handle_peer(
             return;
         }
     };
+
+    // Count peers that don't send a nick-sig yet (lenient mode monitoring).
+    if peer_handshake.nick_sig.is_none() {
+        metrics::counter!("jm_missing_nick_sig_total").increment(1);
+    }
 
     // Classify peer: Maker has a valid onion address; Taker has None
     let (peer_role, peer_onion) = match validated_onion {

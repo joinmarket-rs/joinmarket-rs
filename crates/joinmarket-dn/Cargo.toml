@@ -27,7 +27,7 @@ anyhow = "1"
 thiserror = "1"
 base64 = "0.21"
 metrics = "0.22"
-metrics-exporter-prometheus = { version = "0.13", default-features = false, features = ["http-listener"] }
+metrics-exporter-prometheus = { version = "0.15", default-features = false, features = ["http-listener"] }
 
 [features]
 default = ["tordaemon"]

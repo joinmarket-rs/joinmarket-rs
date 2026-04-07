@@ -254,6 +254,34 @@ enable both simultaneously. The default is `tordaemon`.
 
 ---
 
+## Creating a Release
+
+When tagging a new release, use **git-cliff** to generate the release notes and create the tag in one step:
+
+```bash
+# Let git-cliff auto-bump the version based on commit types (feat → minor, fix → patch, breaking → major)
+git cliff --bump --output CHANGELOG.md
+git add CHANGELOG.md
+git commit -m "chore(release): prepare $(git cliff --bumped-version)"
+git cliff --bump --tag $(git cliff --bumped-version)
+
+# Or specify the version explicitly:
+git cliff --tag v0.2.0 --output CHANGELOG.md
+git add CHANGELOG.md
+git commit -m "chore(release): prepare v0.2.0"
+git tag v0.2.0
+```
+
+- `cliff.toml` is committed to the repo — do not generate changelogs without it.
+- Release notes for a single tag (e.g., for a GitHub Release body) can be extracted with:
+  ```bash
+  git cliff --latest --strip header
+  ```
+- Always use annotated tags (`git tag -a`) or let git-cliff create them; lightweight tags are not recognised as release boundaries by default.
+- Commit messages must follow [Conventional Commits](https://www.conventionalcommits.org/) so git-cliff can group and version correctly.
+
+---
+
 ## Security Tooling
 
 Three tools run against the workspace. All three must pass before a change is considered done.

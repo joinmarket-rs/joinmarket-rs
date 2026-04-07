@@ -10,13 +10,9 @@ use joinmarket_core::fidelity_bond::FidelityBondProof;
 use dashmap::DashMap;
 
 const SHARD_COUNT: usize = 64;
-/// All-peers channel: carries only low-frequency messages (`!orderbook`, `!hp2`,
-/// disconnect notifications). 256 slots is ample for this traffic.
-const BROADCAST_CAPACITY_ALL: usize = 256;
-/// Takers-only channel: carries low-frequency offer startup announcements,
-/// offer-list updates, !cancel, and !tbond. 256 slots matches the all-peers
-/// channel; !orderbook responses are privmsgs and never enter this ring.
-const BROADCAST_CAPACITY_TAKERS: usize = 256;
+/// Broadcast channel capacity. All public messages are low-frequency
+/// (startup announcements, !orderbook, !hp2, disconnect notifications).
+const BROADCAST_CAPACITY: usize = 256;
 const MAX_MAKERS_BEFORE_SAMPLE: usize = 20_000;
 const SAMPLE_TARGET: usize = 4_000;
 
@@ -112,12 +108,8 @@ impl<T: Clone> ShardedRegistry<T> {
 pub struct Router {
     makers: ShardedRegistry<MakerInfo>,
     takers: ShardedRegistry<TakerInfo>,
-    /// Broadcast channel for all connected peers. Carries `!orderbook`, `!hp2`,
-    /// disconnect notifications, and other messages that makers must receive.
+    /// Broadcast channel for all connected peers.
     broadcast_tx: broadcast::Sender<BroadcastMsg>,
-    /// Broadcast channel for takers only. Carries offer announcements (`!sw0absoffer`,
-    /// etc.), `!cancel`, and `!tbond` — messages makers have no use for.
-    broadcast_tx_takers: broadcast::Sender<BroadcastMsg>,
     /// Consolidated per-peer metadata (shutdown token, probe channel, ping support, last_seen, pong_pending).
     peer_meta: DashMap<Arc<str>, PeerMeta>,
     /// Directory node's own nick (set after Tor bootstrap).
@@ -134,29 +126,20 @@ impl Default for Router {
 
 impl Router {
     pub fn new() -> Self {
-        let (broadcast_tx, _) = broadcast::channel(BROADCAST_CAPACITY_ALL);
-        let (broadcast_tx_takers, _) = broadcast::channel(BROADCAST_CAPACITY_TAKERS);
+        let (broadcast_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         Router {
             makers: ShardedRegistry::new(),
             takers: ShardedRegistry::new(),
             broadcast_tx,
-            broadcast_tx_takers,
             peer_meta: DashMap::new(),
             dn_nick: Mutex::new(String::new()),
             dn_location: Mutex::new(String::new()),
         }
     }
 
-    /// Subscribe to the all-peers broadcast channel.
-    /// Both makers and takers call this.
+    /// Subscribe to the broadcast channel.
     pub fn subscribe(&self) -> broadcast::Receiver<BroadcastMsg> {
         self.broadcast_tx.subscribe()
-    }
-
-    /// Subscribe to the takers-only broadcast channel.
-    /// Only taker peer tasks call this; makers never subscribe.
-    pub fn subscribe_takers(&self) -> broadcast::Receiver<BroadcastMsg> {
-        self.broadcast_tx_takers.subscribe()
     }
 
     /// Set the directory node's own identity (called once after Tor bootstrap).
@@ -332,26 +315,12 @@ impl Router {
     }
 
     /// Broadcast to all connected peers (makers and takers).
-    /// Use for `!orderbook`, `!hp2`, disconnect notifications, and any message
-    /// that makers must receive.
     pub fn broadcast(&self, sender_nick: &str, msg: Arc<str>) {
         let _ = self.broadcast_tx.send(BroadcastMsg {
             sender_nick: Arc::from(sender_nick),
             payload: msg,
         });
-        metrics::counter!("jm_messages_broadcast_total", "channel" => "all").increment(1);
-    }
-
-    /// Broadcast to takers only.
-    /// Use for offer announcements, `!cancel`, and `!tbond` — messages that
-    /// makers have no use for. This avoids O(n²) write amplification during
-    /// `!orderbook` events by excluding the (potentially large) maker population.
-    pub fn broadcast_to_takers(&self, sender_nick: &str, msg: Arc<str>) {
-        let _ = self.broadcast_tx_takers.send(BroadcastMsg {
-            sender_nick: Arc::from(sender_nick),
-            payload: msg,
-        });
-        metrics::counter!("jm_messages_broadcast_total", "channel" => "takers").increment(1);
+        metrics::counter!("jm_messages_broadcast_total").increment(1);
     }
 
     /// Broadcast a system message (e.g., disconnect notification) to ALL peers.
@@ -532,47 +501,6 @@ mod tests {
 
         let frame: Arc<str> = "probe".into();
         assert!(!router.send_to_peer("J5testNickOOOOOO", frame));
-    }
-
-    #[test]
-    fn test_broadcast_to_takers_not_visible_on_all_channel() {
-        let router = Router::new();
-        let mut all_rx = router.subscribe();
-
-        router.broadcast_to_takers("J5makerOOOOOOOO", Arc::from("offer-payload"));
-
-        // The all-peers receiver must not see a message sent to the taker channel.
-        assert!(
-            matches!(all_rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
-            "taker-only message leaked onto the all-peers channel"
-        );
-    }
-
-    #[test]
-    fn test_broadcast_not_visible_on_taker_channel() {
-        let router = Router::new();
-        let mut taker_rx = router.subscribe_takers();
-
-        router.broadcast("J5takerNickOOOOO", Arc::from("orderbook-payload"));
-
-        // The taker-only receiver must not see a message sent to the all-peers channel.
-        assert!(
-            matches!(taker_rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
-            "all-peers message leaked onto the taker-only channel"
-        );
-    }
-
-    #[test]
-    fn test_broadcast_to_takers_received_by_taker_subscriber() {
-        let router = Router::new();
-        let mut taker_rx = router.subscribe_takers();
-        let payload: Arc<str> = Arc::from("sw0absoffer-payload");
-
-        router.broadcast_to_takers("J5makerOOOOOOOO", payload.clone());
-
-        let msg = taker_rx.try_recv().expect("taker subscriber should have received the message");
-        assert_eq!(msg.sender_nick.as_ref(), "J5makerOOOOOOOO");
-        assert_eq!(msg.payload, payload);
     }
 
     #[test]

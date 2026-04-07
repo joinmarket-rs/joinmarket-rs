@@ -13,7 +13,7 @@ use joinmarket_core::message::{
 use joinmarket_core::onion::OnionServiceAddr;
 use joinmarket_tor::provider::{BoxReader, BoxWriter};
 
-use crate::router::{Router, MakerInfo, TakerInfo, BroadcastMsg};
+use crate::router::{Router, MakerInfo, TakerInfo};
 use crate::admission::AdmissionController;
 
 /// Python JoinMarket uses MAX_LENGTH = 40000 in its LineReceiver.
@@ -86,18 +86,6 @@ pub struct PeerContext {
     pub directory_nick: Arc<str>,
 }
 
-/// Poll the taker-only broadcast receiver when `Some`, or park forever when `None`.
-/// Using `std::future::pending` as the `None` arm means this branch never resolves
-/// for maker peer tasks, so the `tokio::select!` arm is effectively disabled for
-/// makers at zero runtime cost.
-async fn recv_taker_bcast(
-    rx: &mut Option<broadcast::Receiver<BroadcastMsg>>,
-) -> Result<BroadcastMsg, broadcast::error::RecvError> {
-    match rx {
-        Some(r) => r.recv().await,
-        None => std::future::pending::<Result<BroadcastMsg, broadcast::error::RecvError>>().await,
-    }
-}
 
 /// Write an envelope to a peer connection and log the exchange at TRACE level.
 /// Enable with `RUST_LOG=joinmarket_dn=trace` to see every sent/received message.
@@ -295,16 +283,8 @@ pub async fn handle_peer(
     let shutdown_token = CancellationToken::new();
     router.register_peer_meta(&nick, shutdown_token.clone(), probe_tx, ping_capable, is_maker);
 
-    // Subscribe to the all-peers broadcast channel.
+    // Subscribe to the broadcast channel.
     let mut broadcast_rx = router.subscribe();
-    // Takers additionally subscribe to the offer-only channel so they receive
-    // offer announcements, cancellations, and fidelity bond proofs. Makers use
-    // None — the corresponding select arm parks forever and never fires.
-    let mut taker_broadcast_rx: Option<broadcast::Receiver<BroadcastMsg>> = if !is_maker {
-        Some(router.subscribe_takers())
-    } else {
-        None
-    };
 
     // Per-peer broadcast rate-limiting state (grouped to stay within clippy's arg limit).
     let mut rate_limits = RateLimitState {
@@ -362,33 +342,8 @@ pub async fn handle_peer(
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!(nick = %nick, lagged = n, "Peer lagged on all-peers channel; disconnecting");
-                        metrics::counter!("jm_broadcast_lag_evictions_total", "channel" => "all").increment(1);
-                        break;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-            result = recv_taker_bcast(&mut taker_broadcast_rx) => {
-                match result {
-                    Ok(bcast) => {
-                        // Echo filter: takers don't originate taker-only messages in
-                        // normal operation, but apply it defensively for correctness.
-                        if !bcast.sender_nick.is_empty() && bcast.sender_nick.as_ref() == nick.as_ref() {
-                            continue;
-                        }
-                        tracing::trace!(nick = %nick, raw = %bcast.payload.trim_end_matches(['\r', '\n']), "send taker broadcast");
-                        if writer.write_all(bcast.payload.as_bytes()).await.is_err() {
-                            tracing::warn!(nick = %nick, "Taker broadcast write error");
-                            break;
-                        }
-                        if writer.flush().await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!(nick = %nick, lagged = n, "Peer lagged on taker channel; disconnecting");
-                        metrics::counter!("jm_broadcast_lag_evictions_total", "channel" => "takers").increment(1);
+                        tracing::warn!(nick = %nick, lagged = n, "Peer lagged on broadcast channel; disconnecting");
+                        metrics::counter!("jm_broadcast_lag_evictions_total").increment(1);
                         break;
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -623,167 +578,17 @@ async fn dispatch_pubmsg(
     router: &Router,
     _writer: &mut BufWriter<BoxWriter>,
 ) -> anyhow::Result<()> {
-    broadcast_pubmsg(&nick, &msg.command, body, router);
+    broadcast_pubmsg(&nick, body, router);
     Ok(())
 }
 
-/// Serialise and dispatch a pubmsg to the correct broadcast channel.
-///
-/// Taker-only commands (offer announcements, `!cancel`, `!tbond`) go to the
-/// taker-only channel so that makers — who have no use for this information —
-/// are never burdened with `!orderbook` response traffic.
-/// All other commands (`!orderbook`, `!hp2`) go to the all-peers channel so
-/// that makers receive them as required by the protocol.
-fn broadcast_pubmsg(nick: &Arc<str>, command: &MessageCommand, body: &str, router: &Router) {
+/// Serialise and broadcast a public message to all connected peers.
+fn broadcast_pubmsg(nick: &Arc<str>, body: &str, router: &Router) {
     let pubmsg_line = format!("{}!PUBLIC{}", nick, body);
     let broadcast_msg: Arc<str> = OnionEnvelope::new(msg_type::PUBMSG, pubmsg_line).serialize().into();
-    if command.is_taker_only() {
-        router.broadcast_to_takers(nick.as_ref(), broadcast_msg);
-    } else {
-        router.broadcast(nick.as_ref(), broadcast_msg);
-    }
+    router.broadcast(nick.as_ref(), broadcast_msg);
 }
 
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-    use tokio::sync::broadcast;
-    use joinmarket_core::message::MessageCommand;
-    use crate::router::{Router, BroadcastMsg};
-    use super::broadcast_pubmsg;
-
-    fn make_router() -> Router {
-        Router::new()
-    }
-
-    fn sender_nick() -> Arc<str> {
-        Arc::from("J5senderNickOOOO")
-    }
-
-    /// Assert a message is present on `expected_rx` and absent from `other_rx`.
-    /// `label` names the expected channel for readable failure messages.
-    fn assert_on_channel_only(
-        expected_rx: &mut broadcast::Receiver<BroadcastMsg>,
-        other_rx: &mut broadcast::Receiver<BroadcastMsg>,
-        label: &str,
-    ) {
-        assert!(
-            expected_rx.try_recv().is_ok(),
-            "expected a message on the {label} channel but found none"
-        );
-        assert!(
-            matches!(other_rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
-            "message leaked onto the wrong channel (not {label})"
-        );
-    }
-
-    // ── Taker-only commands ──────────────────────────────────────────────────
-
-    /// All six offer-type commands must be routed exclusively to the
-    /// taker-only channel. Makers have no use for other makers' offer
-    /// announcements and must not receive them.
-    #[test]
-    fn test_offer_commands_route_to_taker_channel_only() {
-        let offer_commands = [
-            MessageCommand::AbsOffer,
-            MessageCommand::RelOffer,
-            MessageCommand::SwAbsOffer,
-            MessageCommand::SwRelOffer,
-            MessageCommand::Sw0AbsOffer,
-            MessageCommand::Sw0RelOffer,
-        ];
-        for command in &offer_commands {
-            let router = make_router();
-            let mut all_rx = router.subscribe();
-            let mut taker_rx = router.subscribe_takers();
-            let nick = sender_nick();
-
-            broadcast_pubmsg(&nick, command, "some offer body", &router);
-
-            assert_on_channel_only(&mut taker_rx, &mut all_rx, "taker");
-        }
-    }
-
-    /// `!cancel` informs takers that an offer has been withdrawn. Makers must
-    /// not receive it — only the takers tracking the orderbook need it.
-    #[test]
-    fn test_cancel_routes_to_taker_channel_only() {
-        let router = make_router();
-        let mut all_rx = router.subscribe();
-        let mut taker_rx = router.subscribe_takers();
-
-        broadcast_pubmsg(&sender_nick(), &MessageCommand::Cancel, "0", &router);
-
-        assert_on_channel_only(&mut taker_rx, &mut all_rx, "taker");
-    }
-
-    /// `!tbond` carries a fidelity bond proof that takers inspect when
-    /// selecting makers. Makers gain nothing from seeing other makers' bonds.
-    #[test]
-    fn test_tbond_routes_to_taker_channel_only() {
-        let router = make_router();
-        let mut all_rx = router.subscribe();
-        let mut taker_rx = router.subscribe_takers();
-
-        broadcast_pubmsg(&sender_nick(), &MessageCommand::TBond, "proof-data", &router);
-
-        assert_on_channel_only(&mut taker_rx, &mut all_rx, "taker");
-    }
-
-    // ── All-peers commands ───────────────────────────────────────────────────
-
-    /// `!orderbook` is sent by takers to prompt makers to re-announce their
-    /// offers. Makers must receive it or they will never respond.
-    #[test]
-    fn test_orderbook_routes_to_all_peers_channel_only() {
-        let router = make_router();
-        let mut all_rx = router.subscribe();
-        let mut taker_rx = router.subscribe_takers();
-
-        broadcast_pubmsg(&sender_nick(), &MessageCommand::Orderbook, "!orderbook", &router);
-
-        assert_on_channel_only(&mut all_rx, &mut taker_rx, "all-peers");
-    }
-
-    /// `!hp2` is a PoDLE commitment broadcast by takers before sending `!fill`.
-    /// Makers must receive it to verify the commitment has not been reused.
-    #[test]
-    fn test_hp2_routes_to_all_peers_channel_only() {
-        let router = make_router();
-        let mut all_rx = router.subscribe();
-        let mut taker_rx = router.subscribe_takers();
-
-        broadcast_pubmsg(&sender_nick(), &MessageCommand::Hp2, "commitment-data", &router);
-
-        assert_on_channel_only(&mut all_rx, &mut taker_rx, "all-peers");
-    }
-
-    // ── Payload correctness ─────────────────────────────────────────────────
-
-    /// Verify the serialised PUBMSG envelope is correctly formed on both
-    /// channels, not just that something arrived.
-    #[test]
-    fn test_broadcast_pubmsg_payload_format() {
-        let router = make_router();
-        let mut taker_rx = router.subscribe_takers();
-        let mut all_rx = router.subscribe();
-        let nick = sender_nick();
-
-        // Taker-only path
-        broadcast_pubmsg(&nick, &MessageCommand::Sw0AbsOffer, "!sw0absoffer minsize=27300", &router);
-        let taker_msg = taker_rx.try_recv().expect("should have message on taker channel");
-        assert!(taker_msg.payload.contains("J5senderNickOOOO!PUBLIC"), "missing from_nick!PUBLIC prefix");
-        assert!(taker_msg.payload.contains("!sw0absoffer minsize=27300"), "missing offer body");
-        assert_eq!(taker_msg.sender_nick.as_ref(), "J5senderNickOOOO", "sender_nick must be set for echo filter");
-
-        // All-peers path
-        // body is the raw post-!PUBLIC text — the command string itself
-        broadcast_pubmsg(&nick, &MessageCommand::Orderbook, "!orderbook", &router);
-        let all_msg = all_rx.try_recv().expect("should have message on all-peers channel");
-        assert!(all_msg.payload.contains("J5senderNickOOOO!PUBLIC"), "missing from_nick!PUBLIC prefix");
-        assert!(all_msg.payload.contains("!orderbook"), "missing orderbook command");
-    }
-}
 
 /// Relay a private message to the target peer and send the sender's location info.
 /// The Python DN forwards ALL privmsgs (not just fill/ioauth/txsigs).

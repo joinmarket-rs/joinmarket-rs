@@ -179,29 +179,6 @@ impl MessageCommand {
             MessageCommand::Sw0RelOffer
         )
     }
-
-    /// Returns `true` if this command is only relevant to takers and should
-    /// therefore be broadcast exclusively on the taker-only channel.
-    ///
-    /// Makers have no use for other makers' offer announcements, cancellations,
-    /// or fidelity bond proofs. Routing these to the taker-only channel avoids
-    /// the O(n²) write amplification that arises when broadcasting to every
-    /// maker during an `!orderbook` event.
-    ///
-    /// Commands NOT in this set (`!orderbook`, `!hp2`) are broadcast to all
-    /// peers because makers must receive them to function correctly.
-    pub fn is_taker_only(&self) -> bool {
-        matches!(self,
-            MessageCommand::AbsOffer |
-            MessageCommand::RelOffer |
-            MessageCommand::SwAbsOffer |
-            MessageCommand::SwRelOffer |
-            MessageCommand::Sw0AbsOffer |
-            MessageCommand::Sw0RelOffer |
-            MessageCommand::Cancel |
-            MessageCommand::TBond
-        )
-    }
 }
 
 impl JmMessage {
@@ -410,25 +387,5 @@ mod tests {
         assert!(!MessageCommand::Cancel.is_offer());
         assert!(!MessageCommand::Fill.is_offer());
         assert!(MessageCommand::Sw0AbsOffer.is_offer());
-    }
-
-    #[test]
-    fn test_is_taker_only() {
-        // All offer types are taker-only
-        assert!(MessageCommand::AbsOffer.is_taker_only());
-        assert!(MessageCommand::RelOffer.is_taker_only());
-        assert!(MessageCommand::SwAbsOffer.is_taker_only());
-        assert!(MessageCommand::SwRelOffer.is_taker_only());
-        assert!(MessageCommand::Sw0AbsOffer.is_taker_only());
-        assert!(MessageCommand::Sw0RelOffer.is_taker_only());
-        // Cancel and TBond are offer-related — taker-only
-        assert!(MessageCommand::Cancel.is_taker_only());
-        assert!(MessageCommand::TBond.is_taker_only());
-        // These must reach makers — NOT taker-only
-        assert!(!MessageCommand::Orderbook.is_taker_only()); // makers respond to this
-        assert!(!MessageCommand::Hp2.is_taker_only());       // makers verify PoDLE
-        // Private commands are never broadcast — not taker-only
-        assert!(!MessageCommand::Fill.is_taker_only());
-        assert!(!MessageCommand::IoAuth.is_taker_only());
     }
 }

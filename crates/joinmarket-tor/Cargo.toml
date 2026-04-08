@@ -38,6 +38,13 @@ optional = true
 version = "0.8"
 optional = true
 
+# Force SQLite to be compiled from source so cross-compilation and CI builds
+# do not require a system-installed libsqlite3.  This is a transitive dep of
+# arti-client → tor-dirmgr → rusqlite → libsqlite3-sys.
+[dependencies.libsqlite3-sys]
+version = "0.36"
+features = ["bundled"]
+optional = true
 
 [features]
 default = ["tordaemon"]
@@ -48,6 +55,7 @@ arti = [         # Arti embedded Tor backend; pulls in LGPL equix/hashx for PoW
     "dep:tor-rtcompat",
     "dep:tor-cell",
     "dep:safelog",
+    "dep:libsqlite3-sys",
 ]
 # NOTE: arti and tordaemon are mutually exclusive.
 # To build with Arti: cargo build --no-default-features --features arti

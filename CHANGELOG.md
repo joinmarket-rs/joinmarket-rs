@@ -2,6 +2,38 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.0-alpha] - 2026-04-08
+
+### Added
+
+- Add handshake edge-case integration tests and reject directory peers
+
+### Changed
+
+- Migrate repository references to joinmarket-rs organisation
+
+### Other
+
+- docs: revise README and AGENTS.md for accuracy; add MIT LICENSE
+- router: dual broadcast channel to route offer pubmsgs to takers only
+- heartbeat: improve liveness probing strategy
+- peer: refine !orderbook rate limiting strategy
+- security: harden input parsing, fix clippy, add deny/audit tooling
+- security: unified peer cap, random shard hasher, secp256k1 upgrade, remove dead code
+- deps: upgrade metrics-exporter-prometheus 0.13 -> 0.15
+- security: fix TOCTOU in admit_peer, validate hostname file, fix metrics registry
+- deps: bump base64 0.21->0.22, fix bond endianness, clear stale audit suppressions
+- docs(agents): add release process using git-cliff
+- revert: remove dual broadcast channel system
+- fix: drop unused msg param from dispatch_pubmsg
+- fix(dn): harden admission, fix race conditions, and improve correctness
+- fix(dn): increase peer channel capacity and distinguish drop reasons
+- fix(dn): harden peer lifecycle, routing, and admission correctness
+
+### Removed
+
+- remove nick-sig validation from handshake
+
 ## [0.1.0-alpha.1] - 2026-03-31
 
 ### Added
@@ -12,6 +44,7 @@ All notable changes to this project will be documented in this file.
 ### Changed
 
 - Align wire protocol commands with Python JoinMarket for compatibility
+- Update changelog for v0.1.0-alpha.1 release
 
 ### Other
 

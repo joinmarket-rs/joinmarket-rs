@@ -133,6 +133,11 @@ pub struct PeerContext {
 
 /// Write an envelope to a peer connection and log the exchange at TRACE level.
 /// Enable with `RUST_LOG=joinmarket_dn=trace` to see every sent/received message.
+///
+/// Each call flushes the writer immediately.  This keeps the implementation
+/// simple and correct (the peer sees every message without delay), at the cost
+/// of one syscall per message.  JoinMarket message rates are low enough (a few
+/// per second per peer at peak) that batching is unnecessary.
 async fn send_envelope(
     writer: &mut BufWriter<BoxWriter>,
     nick: &str,
@@ -314,15 +319,26 @@ pub async fn handle_peer(
     // peerlist, heartbeat probes).
     let (probe_tx, mut probe_rx) = mpsc::channel::<Arc<str>>(PEER_CHANNEL_CAPACITY);
 
-    // Register in router
+    // Register all per-peer metadata and role-specific state together to
+    // minimise the window where admission has passed but the peer is not yet
+    // visible to the router (heartbeat sweeps, privmsg routing, etc.).
+    let shutdown_token = CancellationToken::new();
+    router.register_peer_meta(&nick, shutdown_token.clone(), probe_tx, ping_capable, is_maker);
+
+    // Register in the role-specific registry.  For makers, `peer_onion` is
+    // always `Some` (classification guarantees this), so we can destructure
+    // directly without the dead `if let` guard.
     if is_maker {
-        if let Some(ref onion) = peer_onion {
-            router.register_maker(MakerInfo {
-                nick: nick.clone(),
-                onion_address: onion.clone(),
-                fidelity_bond: bond.map(Arc::new),
-            });
-        }
+        // SAFETY: `is_maker` is true only when `validated_onion` was `Some`,
+        // so `peer_onion` is guaranteed to be `Some` here.
+        let onion = peer_onion.as_ref().expect(
+            "BUG: is_maker is true but peer_onion is None; classification invariant violated"
+        );
+        router.register_maker(MakerInfo {
+            nick: nick.clone(),
+            onion_address: onion.clone(),
+            fidelity_bond: bond.map(Arc::new),
+        });
     } else {
         router.register_taker(TakerInfo {
             nick: nick.clone(),
@@ -337,10 +353,6 @@ pub async fn handle_peer(
         ping_capable,
         "Peer connected"
     );
-
-    // Register all per-peer metadata in a single insertion.
-    let shutdown_token = CancellationToken::new();
-    router.register_peer_meta(&nick, shutdown_token.clone(), probe_tx, ping_capable, is_maker);
 
     // Subscribe to the broadcast channel.
     let mut broadcast_rx = router.subscribe();
@@ -435,20 +447,24 @@ pub async fn handle_peer(
         }
     }
 
-    // Broadcast disconnect notification before deregistering
-    if let Some(loc) = router.locate_peer(nick.as_ref()) {
-        let disconnect_entry = format!("{};{};D", nick, loc);
-        let mut body = disconnect_entry;
-        if let Some((dn_nick, dn_loc)) = router.dn_identity_pair() {
-            body.push(',');
-            body.push_str(&format!("{};{}", dn_nick, dn_loc));
+    // Broadcast disconnect notification before deregistering.
+    // Only makers are included — takers are transient and must never appear
+    // in PEERLIST responses (including disconnect notifications), per protocol.
+    if is_maker {
+        if let Some(loc) = router.locate_peer(nick.as_ref()) {
+            let disconnect_entry = format!("{};{};D", nick, loc);
+            let mut body = disconnect_entry;
+            if let Some((dn_nick, dn_loc)) = router.dn_identity_pair() {
+                body.push(',');
+                body.push_str(&format!("{};{}", dn_nick, dn_loc));
+            }
+            let env = OnionEnvelope::new(msg_type::PEERLIST, body);
+            router.broadcast_raw(Arc::from(env.serialize().as_str()));
         }
-        let env = OnionEnvelope::new(msg_type::PEERLIST, body);
-        router.broadcast_raw(Arc::from(env.serialize().as_str()));
     }
 
     // Cleanup — release_peer is always called because admit_peer is now always called.
-    router.deregister(nick.as_ref());
+    router.deregister(nick.as_ref(), is_maker);
     admission.release_peer(nick.as_ref(), is_maker);
 
     tracing::info!(nick = %nick, "Peer disconnected and deregistered");

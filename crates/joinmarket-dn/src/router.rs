@@ -103,14 +103,17 @@ impl<T: Clone> ShardedRegistry<T> {
         let idx = self.shard_for(&nick);
         let prev = self.shards[idx].lock().insert(nick, info);
         if prev.is_none() {
-            self.count.fetch_add(1, Ordering::Relaxed);
+            self.count.fetch_add(1, Ordering::AcqRel);
         }
     }
 
-    fn remove(&self, nick: &str) {
+    fn remove(&self, nick: &str) -> bool {
         let idx = self.shard_for(nick);
         if self.shards[idx].lock().remove(nick).is_some() {
-            self.count.fetch_sub(1, Ordering::Relaxed);
+            self.count.fetch_sub(1, Ordering::AcqRel);
+            true
+        } else {
+            false
         }
     }
 
@@ -125,8 +128,35 @@ impl<T: Clone> ShardedRegistry<T> {
             .collect()
     }
 
+    /// Collect a random sample of at most `n` values from all shards without
+    /// cloning every entry first.  Each shard is locked individually and its
+    /// values are reservoir-sampled into the output vec, so at most `n` clones
+    /// are performed regardless of the total registry size.
+    fn sample_values(&self, n: usize) -> (Vec<T>, usize) {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let mut reservoir: Vec<T> = Vec::with_capacity(n);
+        let mut total: usize = 0;
+        for shard in &self.shards {
+            let guard = shard.lock();
+            for value in guard.values() {
+                total += 1;
+                if reservoir.len() < n {
+                    reservoir.push(value.clone());
+                } else {
+                    // Reservoir sampling (Algorithm R)
+                    let j = rng.gen_range(0..total);
+                    if j < n {
+                        reservoir[j] = value.clone();
+                    }
+                }
+            }
+        }
+        (reservoir, total)
+    }
+
     fn len(&self) -> usize {
-        self.count.load(Ordering::Relaxed)
+        self.count.load(Ordering::Acquire)
     }
 }
 
@@ -220,12 +250,19 @@ impl Router {
         metrics::counter!("jm_peers_total_registered", "role" => "taker").increment(1);
     }
 
-    pub fn deregister(&self, nick: &str) {
-        self.makers.remove(nick);
-        self.takers.remove(nick);
+    /// Deregister a peer from the appropriate role-specific registry.
+    /// `is_maker` avoids a redundant lock + HashMap lookup on the wrong
+    /// registry and ensures the gauge metric for the other role is not
+    /// momentarily set to a stale value.
+    pub fn deregister(&self, nick: &str, is_maker: bool) {
+        if is_maker {
+            self.makers.remove(nick);
+            metrics::gauge!("jm_peers_active", "role" => "maker").set(self.makers.len() as f64);
+        } else {
+            self.takers.remove(nick);
+            metrics::gauge!("jm_peers_active", "role" => "taker").set(self.takers.len() as f64);
+        }
         self.peer_meta.remove(nick);
-        metrics::gauge!("jm_peers_active", "role" => "maker").set(self.makers.len() as f64);
-        metrics::gauge!("jm_peers_active", "role" => "taker").set(self.takers.len() as f64);
     }
 
     /// Register all per-peer metadata in a single insertion.
@@ -320,27 +357,26 @@ impl Router {
     }
 
     pub fn get_peers_response(&self) -> PeersResponse {
-        let all_makers = self.makers.all_values();
-        let total_makers = all_makers.len();
+        let total_makers = self.makers.len();
 
         if total_makers <= MAX_MAKERS_BEFORE_SAMPLE {
+            let all_makers = self.makers.all_values();
+            let returned = all_makers.len();
             PeersResponse {
-                returned: total_makers,
+                returned,
                 peers: all_makers,
-                total_makers,
+                total_makers: returned,
                 sampling: None,
                 request_more: false,
             }
         } else {
-            use rand::seq::SliceRandom;
-            let mut rng = rand::thread_rng();
-            let mut all_makers = all_makers;
-            let (sampled, _) = all_makers.partial_shuffle(&mut rng, SAMPLE_TARGET);
-            let sample: Vec<MakerInfo> = sampled.to_vec();
+            // Use reservoir sampling to pick SAMPLE_TARGET entries without
+            // cloning the entire registry into a temporary Vec first.
+            let (sample, actual_total) = self.makers.sample_values(SAMPLE_TARGET);
             let returned = sample.len();
             PeersResponse {
                 peers: sample,
-                total_makers,
+                total_makers: actual_total,
                 returned,
                 sampling: Some("random"),
                 request_more: true,
@@ -413,7 +449,7 @@ mod tests {
         assert_eq!(router.maker_count(), 1);
         assert_eq!(router.taker_count(), 0);
 
-        router.deregister("J5testNickOOOOOO");
+        router.deregister("J5testNickOOOOOO", true);
         assert_eq!(router.maker_count(), 0);
     }
 

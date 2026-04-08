@@ -180,11 +180,16 @@ async fn main() -> anyhow::Result<()> {
 
 /// Sanitise a string for inclusion in the MOTD that is sent to every peer.
 ///
-/// Strips control characters except `\n` (which is used as a section delimiter
-/// in the MOTD), limits total length to `max_bytes` **bytes**, and ensures the
-/// result is valid UTF-8.  Prevents log-injection, framing corruption in
-/// clients that parse MOTD naïvely, and social-engineering payloads injected
-/// via a compromised operator-supplied CLI argument.
+/// **Only ASCII graphic characters, spaces, and `\n` are preserved.**
+/// All non-ASCII characters (including Unicode letters, emoji, etc.) are
+/// silently stripped.  This is intentional: the MOTD is embedded in a JSON
+/// string and forwarded to every connecting peer, so restricting to ASCII
+/// prevents log-injection, framing corruption in clients that parse MOTD
+/// naïvely, and social-engineering payloads injected via a compromised
+/// operator-supplied CLI argument.
+///
+/// Total length is capped at `max_bytes` bytes (all remaining chars are ASCII,
+/// so byte length equals character count after filtering).
 fn sanitise_motd(s: &str, max_bytes: usize) -> String {
     let mut out = String::new();
     for c in s.chars() {

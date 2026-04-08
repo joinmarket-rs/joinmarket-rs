@@ -234,6 +234,12 @@ impl JmMessage {
 /// treat it as a nick signature.  This can misidentify a regular field that
 /// happens to be 88 chars of valid base64 decoding to 65 bytes, but in
 /// practice JoinMarket message fields never collide with this pattern.
+///
+/// **Security note:** the directory node does not use `nick_sig` for any
+/// security decisions (authentication, routing, admission).  The field is
+/// extracted here for informational/forwarding purposes only.  If nick-sig
+/// verification is re-enabled in the future, this heuristic must be replaced
+/// with an explicit protocol-level indicator of whether a signature is present.
 fn extract_nick_sig(mut fields: Vec<String>) -> (Vec<String>, Option<RawNickSig>) {
     if let Some(last) = fields.last() {
         let len = last.len();

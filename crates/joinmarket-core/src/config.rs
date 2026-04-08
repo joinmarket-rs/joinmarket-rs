@@ -8,6 +8,12 @@ use crate::onion::OnionServiceAddr;
 /// Verbatim copy of the canonical Python JoinMarket client template
 /// (src/jmclient/configure.py `defaultconfig`, with `_DEFAULT_INTEREST_RATE`
 /// and `_DEFAULT_BONDLESS_MAKERS_ALLOWANCE` substituted for their literal values).
+///
+/// **Note:** many sections (`[YIELDGENERATOR]`, `[PAYJOIN]`, `[SNICKER]`,
+/// `[POLICY]`, `[TIMEOUT]`, etc.) are not used by the directory node.  They
+/// are included so that an operator can share a single `joinmarket.cfg` file
+/// across the DN and other JoinMarket tools.  The DN only reads
+/// `[BLOCKCHAIN]`, `[MESSAGING:onion]`, and `[LOGGING]`.
 pub const DEFAULT_CONFIG: &str = r#"[DAEMON]
 # set to 1 to run the daemon service within this process;
 # set to 0 if the daemon is run separately (using script joinmarketd.py)

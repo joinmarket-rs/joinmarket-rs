@@ -81,6 +81,10 @@ impl Nick {
         (Nick(nick), SigningKey(secret_key))
     }
 
+    /// Parse a nick from a string slice.
+    ///
+    /// Prefer using `s.parse::<Nick>()` (the `FromStr` trait) at call sites.
+    /// This inherent method is kept for backward compatibility.
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<Nick, NickError> {
         if s.len() != NICK_TOTAL_LEN {
@@ -153,6 +157,14 @@ impl Nick {
 impl std::fmt::Display for Nick {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+impl std::str::FromStr for Nick {
+    type Err = NickError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Nick::from_str(s)
     }
 }
 

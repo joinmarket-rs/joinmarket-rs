@@ -127,13 +127,20 @@ impl AdmissionController {
     /// `is_maker` must match the value that was passed to `admit_peer` so that
     /// the sybil guard and bond registry (which are only written for makers)
     /// are not spuriously locked on taker disconnect.
+    ///
+    /// Safe to call multiple times: the nick is checked against `admitted_nicks`
+    /// first, and the counter is only decremented if the nick was actually
+    /// admitted.  This prevents underflow of `peer_count`.
     pub fn release_peer(&self, nick: &str, is_maker: bool) {
+        let was_admitted = self.admitted_nicks.lock().remove(nick);
+        if !was_admitted {
+            return;
+        }
         if is_maker {
             self.sybil_guard.deregister(nick);
             self.bond_registry.deregister_nick(nick);
         }
         self.peer_count.fetch_sub(1, Ordering::AcqRel);
-        self.admitted_nicks.lock().remove(nick);
     }
 }
 

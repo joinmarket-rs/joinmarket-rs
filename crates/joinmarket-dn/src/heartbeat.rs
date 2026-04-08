@@ -140,7 +140,8 @@ fn build_ping_frame() -> Arc<str> {
 
 /// Build a unicast !orderbook PUBMSG envelope addressed from the DN's own nick.
 /// Sent to non-ping makers as a liveness probe: the maker will respond with its
-/// offers as pubmsgs, which update `last_seen` when received by the DN.
+/// offers as a privmsg back to the DN's nick, which updates `last_seen` when
+/// received (the offer data itself is discarded since the DN is not a peer).
 fn build_orderbook_probe_frame(dn_nick: &str) -> Arc<str> {
     let line = make_pubmsg_line(dn_nick, "!orderbook");
     Arc::from(OnionEnvelope::new(msg_type::PUBMSG, line).serialize())

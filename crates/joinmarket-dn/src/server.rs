@@ -75,18 +75,22 @@ pub async fn run_accept_loop(
 
                         let ctx = ctx.clone();
                         let peer_shutdown = shutdown.clone();
-                        let active_connections = active_connections.clone();
+
+                        // RAII guard: decrement on task exit regardless of how
+                        // handle_peer returns (normal, early return, or panic).
+                        // Created *before* the spawn so the counter is decremented
+                        // even if the spawn itself fails (extremely unlikely with
+                        // Tokio, but defensive).
+                        struct ConnectionGuard(Arc<AtomicUsize>);
+                        impl Drop for ConnectionGuard {
+                            fn drop(&mut self) {
+                                self.0.fetch_sub(1, Ordering::AcqRel);
+                            }
+                        }
+                        let guard = ConnectionGuard(active_connections.clone());
 
                         tasks.spawn(async move {
-                            // RAII guard: decrement on task exit regardless of how
-                            // handle_peer returns (normal, early return, or panic).
-                            struct ConnectionGuard(Arc<AtomicUsize>);
-                            impl Drop for ConnectionGuard {
-                                fn drop(&mut self) {
-                                    self.0.fetch_sub(1, Ordering::AcqRel);
-                                }
-                            }
-                            let _guard = ConnectionGuard(active_connections);
+                            let _guard = guard;
 
                             handle_peer(
                                 conn.reader,

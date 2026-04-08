@@ -13,7 +13,7 @@ use joinmarket_core::message::{
 use joinmarket_core::onion::OnionServiceAddr;
 use joinmarket_tor::provider::{BoxReader, BoxWriter};
 
-use crate::router::{Router, MakerInfo, TakerInfo};
+use crate::router::{Router, MakerInfo, TakerInfo, SendResult, PEER_CHANNEL_CAPACITY};
 use crate::admission::AdmissionController;
 
 /// Python JoinMarket uses MAX_LENGTH = 40000 in its LineReceiver.
@@ -25,13 +25,41 @@ const MAX_PUBMSG_PER_MINUTE: usize = 30;
 /// The Python client sends one on connect and one after each coinjoin, so 3/min
 /// is already generous while preventing amplification attacks on makers.
 const MAX_ORDERBOOK_PER_MINUTE: usize = 3;
+/// Per-peer cap on GETPEERLIST requests.  Each response can be up to ~1.4 MB
+/// (20 k makers × 70 bytes) and requires locking all 64 registry shards, so
+/// even a few requests per second from many peers is a significant DoS vector.
+const MAX_GETPEERLIST_PER_MINUTE: usize = 3;
+/// Per-peer cap on PING frames.  The heartbeat loop sends at most one PING per
+/// sweep interval; a legitimate client never sends them manually.
+const MAX_PING_PER_MINUTE: usize = 6;
+/// Maximum bytes of raw peer input included in a single log message.
+/// Prevents log-injection/flooding when an adversary sends oversized or crafted
+/// input that would otherwise be echoed verbatim into warn-level log lines.
+const MAX_LOG_FIELD_BYTES: usize = 256;
 
 /// Per-peer rate-limiting state threaded through `handle_message`.
-/// Grouping both deques into a single struct keeps the function argument count
+/// Grouping all deques into a single struct keeps the function argument count
 /// within clippy's 7-argument limit.
 struct RateLimitState {
-    pubmsg_timestamps: std::collections::VecDeque<Instant>,
-    orderbook_timestamps: std::collections::VecDeque<Instant>,
+    pubmsg_timestamps:      std::collections::VecDeque<Instant>,
+    orderbook_timestamps:   std::collections::VecDeque<Instant>,
+    getpeerlist_timestamps: std::collections::VecDeque<Instant>,
+    ping_timestamps:        std::collections::VecDeque<Instant>,
+}
+
+/// Truncate a string slice to at most `max_bytes` bytes at a valid UTF-8
+/// boundary.  Used to cap the size of peer-supplied data before it is written
+/// to log output, preventing log-injection and log-flooding.
+fn truncate_for_log(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    // Walk back to a char boundary so we don't slice mid-codepoint.
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 /// Read a `\n`-terminated line from a buffered reader without allocating beyond
@@ -169,7 +197,8 @@ pub async fn handle_peer(
     let envelope = match OnionEnvelope::parse(trimmed) {
         Ok(e) => e,
         Err(e) => {
-            tracing::warn!("Invalid handshake envelope JSON: {} (raw: {:?})", e, trimmed);
+            // Truncate raw input before logging to prevent log-injection/flooding.
+            tracing::warn!("Invalid handshake envelope JSON: {} (raw: {:?})", e, truncate_for_log(trimmed, MAX_LOG_FIELD_BYTES));
             metrics::counter!("jm_handshakes_total", "result" => "parse_error").increment(1);
             return;
         }
@@ -190,7 +219,8 @@ pub async fn handle_peer(
     let peer_handshake = match PeerHandshake::parse_json(&envelope.line) {
         Ok(h) => h,
         Err(e) => {
-            tracing::warn!("Invalid peer handshake JSON: {} (raw: {:?})", e, envelope.line);
+            // Truncate the envelope line before logging to prevent log-injection/flooding.
+            tracing::warn!("Invalid peer handshake JSON: {} (raw: {:?})", e, truncate_for_log(&envelope.line, MAX_LOG_FIELD_BYTES));
             metrics::counter!("jm_handshakes_total", "result" => "parse_error").increment(1);
             return;
         }
@@ -230,6 +260,10 @@ pub async fn handle_peer(
                 HandshakeError::MalformedNick => {
                     // Silent disconnect.
                     metrics::counter!("jm_handshakes_total", "result" => "malformed_nick").increment(1);
+                }
+                HandshakeError::FieldTooLong => {
+                    // Silent disconnect — field too long is a protocol violation.
+                    metrics::counter!("jm_handshakes_total", "result" => "field_too_long").increment(1);
                 }
                 HandshakeError::TooManyFeatures(_) | HandshakeError::NestedFeatureValue(_) => {
                     // Silent disconnect.
@@ -276,8 +310,9 @@ pub async fn handle_peer(
     // Detect whether the peer supports !ping/!pong heartbeat.
     let ping_capable = peer_handshake.supports_ping();
 
-    // Create per-peer write channel for heartbeat probes.
-    let (probe_tx, mut probe_rx) = mpsc::channel::<Arc<str>>(16);
+    // Create per-peer write channel for directed messages (privmsg relay,
+    // peerlist, heartbeat probes).
+    let (probe_tx, mut probe_rx) = mpsc::channel::<Arc<str>>(PEER_CHANNEL_CAPACITY);
 
     // Register in router
     if is_maker {
@@ -310,10 +345,12 @@ pub async fn handle_peer(
     // Subscribe to the broadcast channel.
     let mut broadcast_rx = router.subscribe();
 
-    // Per-peer broadcast rate-limiting state (grouped to stay within clippy's arg limit).
+    // Per-peer rate-limiting state (grouped to stay within clippy's arg limit).
     let mut rate_limits = RateLimitState {
-        pubmsg_timestamps: std::collections::VecDeque::new(),
-        orderbook_timestamps: std::collections::VecDeque::new(),
+        pubmsg_timestamps:      std::collections::VecDeque::new(),
+        orderbook_timestamps:   std::collections::VecDeque::new(),
+        getpeerlist_timestamps: std::collections::VecDeque::new(),
+        ping_timestamps:        std::collections::VecDeque::new(),
     };
 
     // Message loop — `line` and `raw_buf` are reused from above.
@@ -475,7 +512,9 @@ async fn handle_message(
                 if from_nick != nick.as_ref() {
                     tracing::warn!(
                         nick = %nick,
-                        from_nick = %from_nick,
+                        // Truncate: from_nick is peer-controlled and could be up to
+                        // MAX_LINE_LEN bytes before the '!' separator.
+                        from_nick = %truncate_for_log(from_nick, MAX_LOG_FIELD_BYTES),
                         "pubmsg from_nick mismatch — disconnecting"
                     );
                     return Err(anyhow::anyhow!("pubmsg from_nick spoofing attempt"));
@@ -542,7 +581,9 @@ async fn handle_message(
                 if from_nick != nick.as_ref() {
                     tracing::warn!(
                         nick = %nick,
-                        from_nick = %from_nick,
+                        // Truncate: from_nick is peer-controlled and could be up to
+                        // MAX_LINE_LEN bytes before the first '!' separator.
+                        from_nick = %truncate_for_log(from_nick, MAX_LOG_FIELD_BYTES),
                         "privmsg from_nick mismatch — disconnecting"
                     );
                     return Err(anyhow::anyhow!("privmsg from_nick spoofing attempt"));
@@ -552,6 +593,20 @@ async fn handle_message(
         }
 
         msg_type::GETPEERLIST => {
+            // Rate-limit: each response serialises up to ~1.4 MB and locks all 64
+            // registry shards; unrestricted flooding is a significant DoS vector.
+            let now = Instant::now();
+            let cutoff = now - Duration::from_secs(60);
+            while rate_limits.getpeerlist_timestamps.front().is_some_and(|&t| t < cutoff) {
+                rate_limits.getpeerlist_timestamps.pop_front();
+            }
+            if rate_limits.getpeerlist_timestamps.len() >= MAX_GETPEERLIST_PER_MINUTE {
+                tracing::warn!(nick = %nick, "GETPEERLIST rate limit exceeded — disconnecting");
+                metrics::counter!("jm_getpeerlist_rate_limit_disconnects_total").increment(1);
+                return Err(anyhow::anyhow!("GETPEERLIST rate limit exceeded"));
+            }
+            rate_limits.getpeerlist_timestamps.push_back(now);
+
             let response = router.get_peers_response();
             let mut entries: Vec<String> = Vec::with_capacity(response.peers.len() + 1);
             // Include DN itself (Python DN always includes itself in the peerlist)
@@ -567,6 +622,20 @@ async fn handle_message(
         }
 
         msg_type::PING => {
+            // Rate-limit PING to prevent a peer from forcing a busy-loop of
+            // allocate→serialise→flush cycles that starve the broadcast select arm.
+            let now = Instant::now();
+            let cutoff = now - Duration::from_secs(60);
+            while rate_limits.ping_timestamps.front().is_some_and(|&t| t < cutoff) {
+                rate_limits.ping_timestamps.pop_front();
+            }
+            if rate_limits.ping_timestamps.len() >= MAX_PING_PER_MINUTE {
+                tracing::warn!(nick = %nick, "PING rate limit exceeded — disconnecting");
+                metrics::counter!("jm_ping_rate_limit_disconnects_total").increment(1);
+                return Err(anyhow::anyhow!("PING rate limit exceeded"));
+            }
+            rate_limits.ping_timestamps.push_back(now);
+
             let env = OnionEnvelope::new(msg_type::PONG, "");
             send_envelope(writer, nick.as_ref(), &env).await?;
         }
@@ -608,20 +677,33 @@ async fn dispatch_privmsg(
     // 1. Forward the original privmsg envelope to the target peer
     let fwd_env = OnionEnvelope::new(msg_type::PRIVMSG, original_line);
     let fwd_bytes: Arc<str> = Arc::from(fwd_env.serialize().as_str());
-    if !router.send_to_peer(to_nick, fwd_bytes) {
-        // Don't count messages directed at the DN's own nick as routing misses;
-        // these are expected privmsg replies to heartbeat !orderbook probes.
-        if router.dn_nick().is_none_or(|n| n.as_ref() != to_nick) {
-            metrics::counter!("jm_router_locate_misses_total").increment(1);
-            tracing::debug!(
+    match router.send_to_peer(to_nick, fwd_bytes) {
+        SendResult::Ok => {
+            metrics::counter!("jm_router_locate_hits_total").increment(1);
+        }
+        SendResult::ChannelFull => {
+            metrics::counter!("jm_router_privmsg_channel_full_total").increment(1);
+            tracing::warn!(
                 from = %from_nick,
                 target = %to_nick,
-                "Target peer not found for privmsg relay"
+                "Privmsg dropped: target peer channel full (backpressure)"
             );
+            return Ok(());
         }
-        return Ok(());
+        SendResult::NotFound => {
+            // Don't count messages directed at the DN's own nick as routing misses;
+            // these are expected privmsg replies to heartbeat !orderbook probes.
+            if router.dn_nick().is_none_or(|n| n.as_ref() != to_nick) {
+                metrics::counter!("jm_router_locate_misses_total").increment(1);
+                tracing::debug!(
+                    from = %from_nick,
+                    target = %to_nick,
+                    "Target peer not found for privmsg relay"
+                );
+            }
+            return Ok(());
+        }
     }
-    metrics::counter!("jm_router_locate_hits_total").increment(1);
 
     // 2. Send a peerlist (type=789) with the sender's location to the target,
     //    so they can connect directly. Include the DN itself.
@@ -634,7 +716,13 @@ async fn dispatch_privmsg(
         }
         let peerlist_env = OnionEnvelope::new(msg_type::PEERLIST, entries.join(","));
         let peerlist_bytes: Arc<str> = Arc::from(peerlist_env.serialize().as_str());
-        router.send_to_peer(to_nick, peerlist_bytes);
+        if let SendResult::ChannelFull = router.send_to_peer(to_nick, peerlist_bytes) {
+            tracing::warn!(
+                from = %from_nick,
+                target = %to_nick,
+                "Peerlist after privmsg dropped: target peer channel full"
+            );
+        }
     }
     Ok(())
 }

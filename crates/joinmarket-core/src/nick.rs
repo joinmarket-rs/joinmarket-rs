@@ -30,34 +30,27 @@ pub enum NickError {
     MissingJPrefix,
     #[error("nick has wrong length: expected {}, got {0}", NICK_TOTAL_LEN)]
     WrongLength(usize),
-    #[error("invalid version byte '{0}': expected '5' (mainnet) or 'M' (testnet/signet)")]
+    #[error("invalid version byte '{0}': expected '5' (JM protocol version)")]
     InvalidVersionByte(char),
-    #[error("nick version byte '{got}' does not match network '{network}' (expected '{expected}')")]
-    WrongVersionForNetwork { network: String, expected: char, got: char },
     #[error("invalid base58 in nick hash portion")]
     InvalidBase58,
     #[error("invalid nick signature")]
     InvalidSignature,
 }
 
-pub enum Network {
-    Mainnet,
-    Testnet,
-    Signet,
-}
-
-impl Network {
-    fn version_byte(&self) -> u8 {
-        match self {
-            Network::Mainnet => b'5',
-            Network::Testnet => b'M',
-            Network::Signet  => b'M',
-        }
-    }
-}
+/// JM protocol version byte embedded as the second character of every nick.
+/// Python: `JM_VERSION = 5` → nick = `'J'` + `str(5)` + hash.  Same on all
+/// Bitcoin networks (mainnet, testnet, signet).
+const JM_VERSION_BYTE: u8 = b'5';
 
 impl Nick {
-    pub fn generate(network: Network) -> (Nick, SigningKey) {
+    /// Generate a new random nick and its signing key.
+    ///
+    /// Algorithm (matching Python JoinMarket `client_protocol.py:set_nick`):
+    /// 1. Generate a random secp256k1 keypair.
+    /// 2. `sha256(hexlify(compressed_pubkey))[..10]` → base58 encode.
+    /// 3. Prepend `"J5"`, right-pad with `'O'` to 16 chars.
+    pub fn generate() -> (Nick, SigningKey) {
         let secp = Secp256k1::new();
         let secret_key = SecretKey::new(&mut secp256k1::rand::thread_rng());
         let public_key = PublicKey::from_secret_key(&secp, &secret_key);
@@ -74,7 +67,7 @@ impl Nick {
 
         // Build nick: "J" + version_byte + base58_hash, right-padded to NICK_TOTAL_LEN with 'O'
         let mut nick = String::from("J");
-        nick.push(network.version_byte() as char);
+        nick.push(JM_VERSION_BYTE as char);
         nick.push_str(&encoded);
 
         if nick.len() > NICK_TOTAL_LEN {
@@ -96,9 +89,10 @@ impl Nick {
         if !s.starts_with('J') {
             return Err(NickError::MissingJPrefix);
         }
-        // Validate version byte (second character)
+        // Validate version byte (second character).  In the Python JoinMarket
+        // protocol this is always '5' (JM_VERSION = 5), on ALL networks.
         let version_byte = s.as_bytes()[1];
-        if version_byte != b'5' && version_byte != b'M' {
+        if version_byte != JM_VERSION_BYTE {
             return Err(NickError::InvalidVersionByte(version_byte as char));
         }
         let hash_part = s[2..].trim_end_matches('O');
@@ -110,29 +104,6 @@ impl Nick {
             }
         }
         Ok(Nick(s.to_string()))
-    }
-
-    /// Validate `s` as a nick AND check that its version byte is consistent
-    /// with `network` (`'5'` for `"mainnet"`, `'M'` for `"testnet"`/`"signet"`).
-    /// This prevents a peer on mainnet from connecting with a testnet-flavoured
-    /// nick (or vice versa) without any diagnostic.
-    pub fn from_str_for_network(s: &str, network: &str) -> Result<Nick, NickError> {
-        let nick = Self::from_str(s)?;
-        // Mirror the Network::version_byte() mapping.
-        let expected: u8 = match network {
-            "testnet" | "signet" => b'M',
-            _ => b'5',
-        };
-        // `from_str` already validated length >= NICK_TOTAL_LEN, so index 1 is safe.
-        let got = s.as_bytes()[1];
-        if got != expected {
-            return Err(NickError::WrongVersionForNetwork {
-                network: network.to_string(),
-                expected: expected as char,
-                got: got as char,
-            });
-        }
-        Ok(nick)
     }
 
     pub fn as_str(&self) -> &str { &self.0 }
@@ -279,8 +250,8 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_nick_mainnet() {
-        let (nick, _key) = Nick::generate(Network::Mainnet);
+    fn test_generate_nick() {
+        let (nick, _key) = Nick::generate();
         let s = nick.as_str();
         assert_eq!(s.len(), NICK_TOTAL_LEN);
         assert!(s.starts_with('J'));
@@ -305,28 +276,28 @@ mod tests {
 
     #[test]
     fn test_generate_roundtrip() {
-        let (nick, _key) = Nick::generate(Network::Mainnet);
+        let (nick, _key) = Nick::generate();
         let reparsed = Nick::from_str(nick.as_str()).unwrap();
         assert_eq!(nick, reparsed);
     }
 
     #[test]
     fn test_sign_and_verify() {
-        let (nick, key) = Nick::generate(Network::Mainnet);
+        let (nick, key) = Nick::generate();
         let sig = key.sign_message(b"hello world", "chan-id");
         assert!(nick.verify_signature(b"hello world", "chan-id", &sig));
     }
 
     #[test]
     fn test_verify_wrong_message_fails() {
-        let (nick, key) = Nick::generate(Network::Mainnet);
+        let (nick, key) = Nick::generate();
         let sig = key.sign_message(b"hello world", "chan-id");
         assert!(!nick.verify_signature(b"different message", "chan-id", &sig));
     }
 
     #[test]
     fn test_verify_wrong_channel_id_fails() {
-        let (nick, key) = Nick::generate(Network::Mainnet);
+        let (nick, key) = Nick::generate();
         let sig = key.sign_message(b"hello world", "chan-id");
         assert!(!nick.verify_signature(b"hello world", "wrong-chan", &sig));
     }
@@ -335,7 +306,7 @@ mod tests {
     fn test_truncated_nick_does_not_verify() {
         // A nick with only a short hash portion (e.g. "J5abcOOOOOOOOOOO") should NOT
         // match a pubkey whose base58 hash merely starts with "abc".
-        let (nick, key) = Nick::generate(Network::Mainnet);
+        let (nick, key) = Nick::generate();
         let sig = key.sign_message(b"test", "chan");
 
         // Construct a fake nick with only the first 3 chars of the hash
@@ -351,7 +322,7 @@ mod tests {
     #[test]
     fn test_all_padding_nick_rejects_signature() {
         let nick = Nick::from_str("J5OOOOOOOOOOOOOO").unwrap();
-        let (_other_nick, key) = Nick::generate(Network::Mainnet);
+        let (_other_nick, key) = Nick::generate();
         let sig = key.sign_message(b"test", "chan");
         // All-padding nick has empty hash portion → verify_signature returns false
         assert!(!nick.verify_signature(b"test", "chan", &sig));
@@ -372,58 +343,28 @@ mod tests {
     }
 
     #[test]
-    fn test_from_str_for_network_mainnet_ok() {
-        // '5' version byte is valid on mainnet
-        let nick = Nick::from_str_for_network("J5xhGSWE7VrxM7sO", "mainnet");
-        assert!(nick.is_ok());
+    fn test_version_5_accepted() {
+        // '5' is the only valid JM protocol version byte.
+        assert!(Nick::from_str("J5xhGSWE7VrxM7sO").is_ok());
     }
 
     #[test]
-    fn test_from_str_for_network_testnet_ok() {
-        // 'M' version byte is valid on testnet
-        let nick = Nick::from_str_for_network("JMxhGSWE7VrxM7sO", "testnet");
-        assert!(nick.is_ok());
-    }
-
-    #[test]
-    fn test_from_str_for_network_signet_ok() {
-        // 'M' version byte is valid on signet
-        let nick = Nick::from_str_for_network("JMxhGSWE7VrxM7sO", "signet");
-        assert!(nick.is_ok());
-    }
-
-    #[test]
-    fn test_from_str_for_network_mainnet_nick_rejected_on_testnet() {
-        // '5' version byte must be rejected on testnet
-        let err = Nick::from_str_for_network("J5xhGSWE7VrxM7sO", "testnet").unwrap_err();
-        assert!(matches!(err, NickError::WrongVersionForNetwork { .. }),
-            "expected WrongVersionForNetwork, got {:?}", err);
-    }
-
-    #[test]
-    fn test_from_str_for_network_testnet_nick_rejected_on_mainnet() {
-        // 'M' version byte must be rejected on mainnet
-        let err = Nick::from_str_for_network("JMxhGSWE7VrxM7sO", "mainnet").unwrap_err();
-        assert!(matches!(err, NickError::WrongVersionForNetwork { .. }),
-            "expected WrongVersionForNetwork, got {:?}", err);
-    }
-
-    #[test]
-    fn test_from_str_for_network_unknown_network_treated_as_mainnet() {
-        // Unknown network strings fall through to the mainnet default ('5')
-        assert!(Nick::from_str_for_network("J5xhGSWE7VrxM7sO", "regtest").is_ok());
-        assert!(Nick::from_str_for_network("JMxhGSWE7VrxM7sO", "regtest").is_err());
+    fn test_version_m_rejected() {
+        // 'M' version byte does not exist in the Python protocol.
+        let err = Nick::from_str("JMxhGSWE7VrxM7sO").unwrap_err();
+        assert!(matches!(err, NickError::InvalidVersionByte('M')),
+            "expected InvalidVersionByte('M'), got {:?}", err);
     }
 
     #[test]
     fn test_nick_sig_base64_roundtrip() {
-        let (_nick, key) = Nick::generate(Network::Mainnet);
+        let (_nick, key) = Nick::generate();
         let sig = key.sign_message(b"test", "chan");
         let b64 = sig.to_base64();
         assert_eq!(b64.len(), 88); // base64 of 65 bytes
         let decoded = NickSig::from_base64(&b64).unwrap();
         // Verify the round-tripped sig still works
-        let (_nick2, _key2) = Nick::generate(Network::Mainnet);
+        let (_nick2, _key2) = Nick::generate();
         let _ = decoded; // decoded is a valid NickSig
         // Just verify the bytes round-trip
         assert_eq!(sig.to_bytes(), NickSig::from_base64(&b64).unwrap().to_bytes());

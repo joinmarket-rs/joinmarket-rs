@@ -13,8 +13,11 @@ pub struct SybilGuard {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SybilError {
-    #[error("onion {onion} already has active nick {existing_nick}")]
-    DuplicateOnion { onion: String, existing_nick: String },
+    /// The onion address is already registered to a different nick.
+    /// The conflicting nick is intentionally *not* included in the `Display`
+    /// output to prevent nick enumeration via admission-rejection log lines.
+    #[error("onion address already has an active registration")]
+    DuplicateOnion,
 }
 
 impl Default for SybilGuard {
@@ -37,10 +40,14 @@ impl SybilGuard {
         let mut maps = self.inner.lock();
         if let Some(existing_nick) = maps.onion_to_nick.get(onion) {
             if existing_nick != nick {
-                return Err(SybilError::DuplicateOnion {
-                    onion: onion.as_str().to_string(),
-                    existing_nick: existing_nick.clone(),
-                });
+                // Log at DEBUG only — logging the existing nick at WARN would allow
+                // an adversary to enumerate nick→onion mappings by probing with
+                // controlled onion keys and reading warn-level log output.
+                tracing::debug!(
+                    onion = %onion.as_str(),
+                    "sybil: onion already registered to a different nick"
+                );
+                return Err(SybilError::DuplicateOnion);
             }
         }
         maps.onion_to_nick.insert(onion.clone(), nick.to_string());
@@ -81,7 +88,7 @@ mod tests {
         let guard = SybilGuard::new();
         guard.register("J5nickAAAAAAAA0", &test_onion()).unwrap();
         let err = guard.register("J5nickBBBBBBBB0", &test_onion()).unwrap_err();
-        assert!(matches!(err, SybilError::DuplicateOnion { .. }));
+        assert!(matches!(err, SybilError::DuplicateOnion));
     }
 
     #[test]

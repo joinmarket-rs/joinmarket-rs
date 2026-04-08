@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::hash::BuildHasher;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use tokio::sync::{broadcast, mpsc};
@@ -13,8 +14,25 @@ const SHARD_COUNT: usize = 64;
 /// Broadcast channel capacity. All public messages are low-frequency
 /// (startup announcements, !orderbook, !hp2, disconnect notifications).
 const BROADCAST_CAPACITY: usize = 256;
+/// Per-peer directed-message channel capacity.  Each privmsg relay pushes two
+/// messages (the privmsg itself + a peerlist with the sender's location), and
+/// busy makers can receive privmsgs from many takers concurrently.  The old
+/// value of 16 was too small and caused silent message drops when a maker's Tor
+/// circuit was slow to drain.  128 gives ample headroom.
+pub(crate) const PEER_CHANNEL_CAPACITY: usize = 128;
 const MAX_MAKERS_BEFORE_SAMPLE: usize = 20_000;
 const SAMPLE_TARGET: usize = 4_000;
+
+/// Result of attempting to send a directed message to a peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendResult {
+    /// Message was queued successfully.
+    Ok,
+    /// Peer exists but its channel is full (backpressure).
+    ChannelFull,
+    /// Peer not found in the registry or its channel is closed.
+    NotFound,
+}
 
 /// Broadcast message carrying the sender's nick for echo filtering.
 /// Peers skip messages where `sender_nick` matches their own nick.
@@ -61,6 +79,9 @@ struct ShardedRegistry<T> {
     /// Random seed chosen at construction time; prevents hash-flooding attacks
     /// where an adversary crafts nick strings that all map to the same shard.
     hash_builder: std::collections::hash_map::RandomState,
+    /// Atomic entry count maintained by `insert`/`remove` so that `len()` is a
+    /// single atomic load instead of locking all 64 shards.
+    count: AtomicUsize,
 }
 
 impl<T: Clone> ShardedRegistry<T> {
@@ -70,6 +91,7 @@ impl<T: Clone> ShardedRegistry<T> {
                 .map(|_| Mutex::new(HashMap::new()))
                 .collect(),
             hash_builder: std::collections::hash_map::RandomState::new(),
+            count: AtomicUsize::new(0),
         }
     }
 
@@ -79,12 +101,17 @@ impl<T: Clone> ShardedRegistry<T> {
 
     fn insert(&self, nick: Arc<str>, info: T) {
         let idx = self.shard_for(&nick);
-        self.shards[idx].lock().insert(nick, info);
+        let prev = self.shards[idx].lock().insert(nick, info);
+        if prev.is_none() {
+            self.count.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn remove(&self, nick: &str) {
         let idx = self.shard_for(nick);
-        self.shards[idx].lock().remove(nick);
+        if self.shards[idx].lock().remove(nick).is_some() {
+            self.count.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     fn get(&self, nick: &str) -> Option<T> {
@@ -99,9 +126,7 @@ impl<T: Clone> ShardedRegistry<T> {
     }
 
     fn len(&self) -> usize {
-        self.shards.iter()
-            .map(|s| s.lock().len())
-            .sum()
+        self.count.load(Ordering::Relaxed)
     }
 }
 
@@ -169,12 +194,15 @@ impl Router {
     }
 
     /// Send a message to a specific peer via its dedicated write channel.
-    /// Returns true if the message was sent, false if the peer is not found, channel is closed, or full.
-    pub fn send_to_peer(&self, nick: &str, msg: Arc<str>) -> bool {
+    pub fn send_to_peer(&self, nick: &str, msg: Arc<str>) -> SendResult {
         if let Some(meta) = self.peer_meta.get(nick) {
-            meta.probe_tx.try_send(msg).is_ok()
+            match meta.probe_tx.try_send(msg) {
+                Ok(()) => SendResult::Ok,
+                Err(mpsc::error::TrySendError::Full(_)) => SendResult::ChannelFull,
+                Err(mpsc::error::TrySendError::Closed(_)) => SendResult::NotFound,
+            }
         } else {
-            false
+            SendResult::NotFound
         }
     }
 
@@ -503,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn test_send_to_peer_closed_channel_returns_false() {
+    fn test_send_to_peer_closed_channel_returns_not_found() {
         let router = Router::new();
         let nick: Arc<str> = "J5testNickOOOOOO".into();
         let (tx, rx) = mpsc::channel::<Arc<str>>(16);
@@ -518,7 +546,29 @@ mod tests {
         drop(rx); // close the receiver
 
         let frame: Arc<str> = "probe".into();
-        assert!(!router.send_to_peer("J5testNickOOOOOO", frame));
+        assert_eq!(router.send_to_peer("J5testNickOOOOOO", frame), SendResult::NotFound);
+    }
+
+    #[test]
+    fn test_send_to_peer_channel_full_returns_channel_full() {
+        let router = Router::new();
+        let nick: Arc<str> = "J5testNickOOOOOO".into();
+        // Tiny channel of capacity 2 so we can fill it easily.
+        let (tx, _rx) = mpsc::channel::<Arc<str>>(2);
+        router.peer_meta.insert(nick.clone(), PeerMeta {
+            shutdown: CancellationToken::new(),
+            probe_tx: tx,
+            supports_ping: false,
+            is_maker: false,
+            last_seen: Instant::now(),
+            pong_pending: false,
+        });
+
+        // Fill the channel.
+        assert_eq!(router.send_to_peer("J5testNickOOOOOO", "a".into()), SendResult::Ok);
+        assert_eq!(router.send_to_peer("J5testNickOOOOOO", "b".into()), SendResult::Ok);
+        // Third message should be dropped.
+        assert_eq!(router.send_to_peer("J5testNickOOOOOO", "c".into()), SendResult::ChannelFull);
     }
 
     /// Regression test for the two-phase TOCTOU race in `collect_pong_timeouts`.

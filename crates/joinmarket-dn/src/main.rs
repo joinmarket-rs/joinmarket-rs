@@ -136,11 +136,17 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Onion address: {}", node_location);
 
     // Build MOTD: "DIRECTORY NODE: <onion:port>\nJOINMARKET VERSION: joinmarket-rs/<ver>\n<operator_message>"
+    // The operator message is sanitised to prevent control-character injection and
+    // social-engineering payloads from being forwarded to every connecting peer.
+    let operator_msg = sanitise_motd(
+        args.operator_message.as_deref().unwrap_or(""),
+        512,
+    );
     let motd = format!(
         "DIRECTORY NODE: {}\nJOINMARKET VERSION: joinmarket-rs/{}\n{}",
         node_location,
         joinmarket_core::CORE_VERSION,
-        args.operator_message.as_deref().unwrap_or("")
+        operator_msg,
     );
 
     // Start heartbeat loop
@@ -170,6 +176,27 @@ async fn main() -> anyhow::Result<()> {
     // any such panic will be printed but will not prevent clean shutdown.
     // TODO: remove this comment once the upstream Arti shutdown bug is resolved.
     Ok(())
+}
+
+/// Sanitise a string for inclusion in the MOTD that is sent to every peer.
+///
+/// Strips control characters except `\n` (which is used as a section delimiter
+/// in the MOTD), limits total length to `max_bytes` **bytes**, and ensures the
+/// result is valid UTF-8.  Prevents log-injection, framing corruption in
+/// clients that parse MOTD naïvely, and social-engineering payloads injected
+/// via a compromised operator-supplied CLI argument.
+fn sanitise_motd(s: &str, max_bytes: usize) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        if !(c.is_ascii_graphic() || c == ' ' || c == '\n') {
+            continue;
+        }
+        if out.len() + c.len_utf8() > max_bytes {
+            break;
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Expand a leading `~` to `$HOME`. Returns the string unchanged if it does

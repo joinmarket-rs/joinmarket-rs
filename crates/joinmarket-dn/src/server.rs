@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use joinmarket_tor::provider::TorProvider;
-use joinmarket_core::nick::{Nick, Network as NickNetwork};
+use joinmarket_core::nick::Nick;
 
 use crate::router::Router;
 use crate::admission::AdmissionController;
@@ -27,12 +27,7 @@ pub async fn run_accept_loop(
 ) -> anyhow::Result<()> {
     let directory_onion = tor.onion_address().to_string();
 
-    let nick_network = match network.as_str() {
-        "testnet" => NickNetwork::Testnet,
-        "signet"  => NickNetwork::Signet,
-        _         => NickNetwork::Mainnet,
-    };
-    let (directory_nick, _) = Nick::generate(nick_network);
+    let (directory_nick, _) = Nick::generate();
     let directory_nick = directory_nick.to_string();
     let directory_location = format!("{}:{}", directory_onion, crate::VIRTUAL_PORT);
 

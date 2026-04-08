@@ -11,6 +11,8 @@ async-trait = "0.1"
 anyhow = "1"
 thiserror = "1"
 tracing = "0.1"
+data-encoding = "2"
+sha3 = "0.10"
 
 [dependencies.arti-client]
 version = "0.40"

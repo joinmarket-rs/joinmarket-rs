@@ -8,7 +8,22 @@
 # available fix; each entry documents why the suppression is safe.
 
 [advisories]
-ignore = []
+# Suppress arti-feature-only advisories.  These affect *only* the
+# `--features arti` build; the default `tordaemon` build is unaffected.
+# Each entry documents the reason the suppression is safe.
+ignore = [
+    # RUSTSEC-2025-0141 — bincode 2.x is unmaintained.
+    # Transitive dep of tor-netdir (typed-index-collections → bincode).
+    # No fix available upstream; bincode does not affect the security boundary
+    # of the DN (it is used internally by Arti for directory data structures,
+    # not for any peer-supplied input).  Monitor arti-client releases for removal.
+    "RUSTSEC-2025-0141",
+    # RUSTSEC-2024-0436 — paste 1.x is unmaintained.
+    # Transitive dep of tor-rtcompat and many other Arti crates.
+    # paste is a proc-macro used at compile time only; it has no runtime
+    # attack surface.  Monitor arti-client releases for removal.
+    "RUSTSEC-2024-0436",
+]
 
 # ── License policy ────────────────────────────────────────────────────────────
 

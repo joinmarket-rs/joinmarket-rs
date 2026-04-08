@@ -68,24 +68,66 @@ impl CTorProvider {
     }
 }
 
-/// Validate that `addr` looks like a Tor v3 onion address (62 chars, valid
-/// base32 prefix, `.onion` suffix). This catches common misconfigurations
-/// (wrong file, v2 address, corrupted content) at startup rather than
-/// letting the server run with an unusable address.
+/// Validate that `addr` is a well-formed, cryptographically correct Tor v3
+/// onion address.  Performs the same checks as `joinmarket_core::onion::
+/// OnionAddress::parse`:
+///
+/// 1. Length == 62 chars (56 base32 + ".onion").
+/// 2. `.onion` suffix present.
+/// 3. Base32 decodes without error.
+/// 4. Version byte (decoded[34]) == 0x03.
+/// 5. SHA3-256 checksum over the public key matches decoded[32..34].
+///
+/// This catches common misconfigurations (wrong file, v2 address, corrupted
+/// content, address truncated by an editor) at startup rather than letting the
+/// server run with an address that cannot be reached.
 fn validate_onion_hostname(addr: &str) -> Result<(), String> {
-    if addr.len() != 62 {
+    use sha3::{Digest, Sha3_256};
+
+    let lower = addr.to_lowercase();
+
+    if lower.len() != 62 {
         return Err(format!(
             "wrong length: expected 62 chars (v3 onion address), got {}",
-            addr.len()
+            lower.len()
         ));
     }
-    if !addr.ends_with(".onion") {
+    if !lower.ends_with(".onion") {
         return Err("does not end with '.onion'".to_string());
     }
-    let base32_part = &addr[..56];
-    if !base32_part.bytes().all(|b| matches!(b, b'a'..=b'z' | b'2'..=b'7')) {
-        return Err("base32 prefix contains invalid characters (expected a-z and 2-7)".to_string());
+
+    let encoded = &lower[..56];
+    let decoded = data_encoding::BASE32_NOPAD
+        .decode(encoded.to_uppercase().as_bytes())
+        .map_err(|e| format!("invalid base32 encoding: {e}"))?;
+
+    if decoded.len() != 35 {
+        return Err(format!(
+            "base32 decoded to {} bytes, expected 35",
+            decoded.len()
+        ));
     }
+
+    let pubkey   = &decoded[0..32];
+    let checksum = &decoded[32..34];
+    let version  =  decoded[34];
+
+    if version != 0x03 {
+        return Err(format!(
+            "wrong version byte: expected 0x03, got {version:#04x}"
+        ));
+    }
+
+    let mut hasher = Sha3_256::new();
+    hasher.update(b".onion checksum");
+    hasher.update(pubkey);
+    hasher.update([version]);
+    let hash = hasher.finalize();
+
+    if &hash[0..2] != checksum {
+        return Err("checksum mismatch: address is corrupt or truncated".to_string());
+    }
+
     Ok(())
 }
 
@@ -136,20 +178,30 @@ mod tests {
 
     #[test]
     fn test_invalid_base32_chars_rejected() {
-        // Replace first char with '0' which is not valid base32
+        // '0' is not in the base32 alphabet (A-Z, 2-7); full decode now catches it.
         let bad = format!("0{}.onion", &VALID[1..56]);
         let err = validate_onion_hostname(&bad).unwrap_err();
-        assert!(err.contains("invalid characters"), "{err}");
+        assert!(err.contains("base32"), "{err}");
     }
 
     #[test]
-    fn test_uppercase_rejected() {
-        // validate_onion_hostname expects lowercase (Tor writes lowercase).
-        // Uppercase input has a wrong suffix (.ONION not .onion), so the
-        // suffix check fires first.
+    fn test_uppercase_accepted() {
+        // The validator now normalises to lowercase internally, so uppercase input
+        // representing a valid v3 address must be accepted.
         let upper = VALID.to_uppercase();
-        let err = validate_onion_hostname(&upper).unwrap_err();
-        assert!(err.contains(".onion") || err.contains("invalid characters"), "{err}");
+        assert!(validate_onion_hostname(&upper).is_ok(),
+            "uppercase valid address should be accepted after lowercasing");
+    }
+
+    #[test]
+    fn test_checksum_mismatch_rejected() {
+        // Corrupt the first character of VALID (keeping length and base32 charset
+        // intact) to produce a valid-looking but cryptographically incorrect address.
+        let mut chars: Vec<char> = VALID.chars().collect();
+        chars[0] = if chars[0] == '2' { '3' } else { '2' };
+        let corrupted: String = chars.into_iter().collect();
+        let err = validate_onion_hostname(&corrupted).unwrap_err();
+        assert!(err.contains("checksum") || err.contains("version"), "{err}");
     }
 
     #[test]

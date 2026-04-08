@@ -24,15 +24,45 @@ pub struct PeerHandshake {
 
 /// Maximum number of entries allowed in the handshake `features` map.
 const MAX_FEATURES_ENTRIES: usize = 32;
+/// Maximum byte length for short string fields (app-name, network, nick).
+/// Legitimate values are always short identifiers; this cap prevents oversized
+/// strings from being heap-allocated and echoed into error-message display
+/// strings or log entries.
+const MAX_FIELD_LEN: usize = 64;
+/// Maximum byte length for the `location-string` field.  A valid value is at
+/// most 68 bytes: 62-char v3 onion + `:` + up to 5-digit port.  We use 72
+/// for a small margin.
+const MAX_LOCATION_LEN: usize = 72;
+/// Maximum byte length of a single key in the `features` map.
+/// Legitimate keys ("ping", "fidelity_bond") are very short.
+const MAX_FEATURE_KEY_LEN: usize = 64;
+/// Maximum byte length of a single scalar string value in the `features` map.
+/// The largest legitimate value is `fidelity_bond` (~336 bytes base64 of 252).
+const MAX_FEATURE_VALUE_LEN: usize = 512;
 
 impl PeerHandshake {
     pub fn parse_json(json: &str) -> Result<Self, HandshakeError> {
         let msg: PeerHandshake = serde_json::from_str(json)?;
+        // Reject oversized string fields before they can be stored, echoed into
+        // error-message display strings, or written to log files.
+        if msg.app_name.len() > MAX_FIELD_LEN
+            || msg.network.len() > MAX_FIELD_LEN
+            || msg.nick.len() > MAX_FIELD_LEN
+            || msg.location_string.len() > MAX_LOCATION_LEN
+        {
+            return Err(HandshakeError::FieldTooLong);
+        }
         if msg.features.len() > MAX_FEATURES_ENTRIES {
             return Err(HandshakeError::TooManyFeatures(msg.features.len()));
         }
-        // Reject deeply nested values (only scalars and single-level objects allowed)
+        // Reject oversized feature keys, oversized string values, and nested structures.
         for (key, value) in &msg.features {
+            if key.len() > MAX_FEATURE_KEY_LEN {
+                return Err(HandshakeError::FieldTooLong);
+            }
+            if value.as_str().is_some_and(|s| s.len() > MAX_FEATURE_VALUE_LEN) {
+                return Err(HandshakeError::FieldTooLong);
+            }
             if value.is_object() || value.is_array() {
                 return Err(HandshakeError::NestedFeatureValue(key.clone()));
             }
@@ -83,7 +113,7 @@ impl PeerHandshake {
                 got: self.network.clone(),
             });
         }
-        crate::nick::Nick::from_str_for_network(&self.nick, expected_network)
+        crate::nick::Nick::from_str(&self.nick)
             .map_err(|_| HandshakeError::MalformedNick)?;
         if !self.location_string.is_empty()
             && self.location_string != crate::message::NOT_SERVING_ONION
@@ -139,6 +169,8 @@ pub enum HandshakeError {
     TooManyFeatures(usize),
     #[error("nested value not allowed in features key '{0}'")]
     NestedFeatureValue(String),
+    #[error("handshake field or feature value exceeds maximum allowed length")]
+    FieldTooLong,
     #[error("invalid onion address in location-string: {0}")]
     InvalidOnionAddress(#[from] crate::onion::OnionServiceAddrError),
     #[error("JSON parse error: {0}")]
@@ -215,8 +247,15 @@ mod tests {
 
     #[test]
     fn test_peer_handshake_with_fidelity_bond() {
-        // Create a valid 252-byte bond blob
-        let blob = vec![0u8; 252];
+        // Compressed secp256k1 generator point G (valid curve point).
+        let g: [u8; 33] = [
+            0x02, 0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95,
+            0xce, 0x87, 0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59,
+            0xf2, 0x81, 0x5b, 0x16, 0xf8, 0x17, 0x98,
+        ];
+        let mut blob = vec![0u8; 252];
+        blob[144..177].copy_from_slice(&g); // cert_pubkey
+        blob[179..212].copy_from_slice(&g); // utxo_pubkey
         let bond_b64 = base64::engine::general_purpose::STANDARD.encode(&blob);
         let json = format!(
             r#"{{"app-name":"joinmarket","directory":false,"location-string":"","proto-ver":5,"features":{{"fidelity_bond":"{bond_b64}"}},"nick":"J5xhGSWE7VrxM7sO","network":"mainnet"}}"#
@@ -227,18 +266,53 @@ mod tests {
 
     #[test]
     fn test_validate_wrong_nick_version_byte() {
-        // Nick with 'M' (testnet) version byte presented to a mainnet DN
+        // 'M' is not a valid JM version byte (Python always uses '5').
+        // The nick must be rejected regardless of which network the DN serves.
         let json = r#"{"app-name":"joinmarket","directory":false,"location-string":"","proto-ver":5,"features":{},"nick":"JMxhGSWE7VrxM7sO","network":"mainnet"}"#;
         let msg = PeerHandshake::parse_json(json).unwrap();
         let err = msg.validate("mainnet").unwrap_err();
         assert!(matches!(err, HandshakeError::MalformedNick),
-            "expected MalformedNick for wrong version byte, got {:?}", err);
+            "expected MalformedNick for invalid version byte, got {:?}", err);
     }
 
     #[test]
     fn test_peer_handshake_no_bond() {
         let msg = PeerHandshake::parse_json(valid_handshake_json()).unwrap();
         assert!(msg.fidelity_bond().is_none());
+    }
+
+    #[test]
+    fn test_oversized_app_name_rejected() {
+        // app_name > MAX_FIELD_LEN (64) must be rejected at parse time.
+        let long_name = "x".repeat(65);
+        let json = format!(
+            "{{\"app-name\":\"{long_name}\",\"directory\":false,\"location-string\":\"\",\"proto-ver\":5,\"features\":{{}},\"nick\":\"J5xhGSWE7VrxM7sO\",\"network\":\"mainnet\"}}"
+        );
+        let err = PeerHandshake::parse_json(&json).unwrap_err();
+        assert!(matches!(err, HandshakeError::FieldTooLong),
+            "expected FieldTooLong, got {:?}", err);
+    }
+
+    #[test]
+    fn test_oversized_network_rejected() {
+        let long_net = "n".repeat(65);
+        let json = format!(
+            "{{\"app-name\":\"joinmarket\",\"directory\":false,\"location-string\":\"\",\"proto-ver\":5,\"features\":{{}},\"nick\":\"J5xhGSWE7VrxM7sO\",\"network\":\"{long_net}\"}}"
+        );
+        let err = PeerHandshake::parse_json(&json).unwrap_err();
+        assert!(matches!(err, HandshakeError::FieldTooLong),
+            "expected FieldTooLong, got {:?}", err);
+    }
+
+    #[test]
+    fn test_oversized_feature_key_rejected() {
+        let long_key = "k".repeat(65);
+        let json = format!(
+            "{{\"app-name\":\"joinmarket\",\"directory\":false,\"location-string\":\"\",\"proto-ver\":5,\"features\":{{\"{long_key}\":true}},\"nick\":\"J5xhGSWE7VrxM7sO\",\"network\":\"mainnet\"}}"
+        );
+        let err = PeerHandshake::parse_json(&json).unwrap_err();
+        assert!(matches!(err, HandshakeError::FieldTooLong),
+            "expected FieldTooLong, got {:?}", err);
     }
 
 }

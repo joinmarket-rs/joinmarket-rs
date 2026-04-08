@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use joinmarket_core::message::{OnionEnvelope, make_pubmsg_line, msg_type};
-use crate::router::Router;
+use crate::router::{Router, SendResult};
 
 /// How often to sweep for idle peers.
 const IDLE_CHECK_INTERVAL_SECS: u64 = 60; // 1 min
@@ -29,6 +29,16 @@ pub async fn heartbeat_loop(router: Arc<Router>, shutdown: CancellationToken) {
                 tracing::debug!(makers, takers, "Heartbeat: idle sweep");
 
                 // Step 1: Hard-evict peers idle > 25 min (no probe, just disconnect).
+                //
+                // Note: eviction is not fully atomic.  `collect_idle_peers` removes
+                // the peer from `peer_meta` and cancels its shutdown token, which
+                // causes the peer task to break out of its select loop and run
+                // cleanup (deregister from makers/takers, release admission slot).
+                // Between the `retain()` here and the task's cleanup, the peer
+                // still appears in GETPEERLIST responses and holds a capacity slot.
+                // This window is brief (sub-millisecond under normal scheduling)
+                // and unavoidable without coupling the heartbeat to the peer task's
+                // lifecycle, which would introduce lock-ordering complexity.
                 let hard_evicted = router.collect_idle_peers(
                     Duration::from_secs(HARD_EVICT_THRESHOLD_SECS)
                 );
@@ -67,20 +77,32 @@ pub async fn heartbeat_loop(router: Arc<Router>, shutdown: CancellationToken) {
 
                 for (nick, supports_ping, is_maker) in &peers_to_probe {
                     if *supports_ping {
-                        if router.send_to_peer(nick, ping_frame.clone()) {
-                            router.add_pong_pending(nick);
-                            ping_sent = true;
-                            metrics::counter!("jm_heartbeat_ping_probes_total").increment(1);
-                            tracing::debug!(%nick, "Sent !ping probe");
+                        match router.send_to_peer(nick, ping_frame.clone()) {
+                            SendResult::Ok => {
+                                router.add_pong_pending(nick);
+                                ping_sent = true;
+                                metrics::counter!("jm_heartbeat_ping_probes_total").increment(1);
+                                tracing::debug!(%nick, "Sent !ping probe");
+                            }
+                            SendResult::ChannelFull => {
+                                tracing::warn!(%nick, "Ping probe dropped: peer channel full");
+                            }
+                            SendResult::NotFound => {}
                         }
                     } else if *is_maker {
                         // Non-ping maker: unicast !orderbook to elicit an offer
                         // re-announcement, which will refresh last_seen when received.
                         // Skipped if DN identity isn't set yet (orderbook_frame is None).
                         if let Some(ref frame) = orderbook_frame {
-                            if router.send_to_peer(nick, frame.clone()) {
-                                metrics::counter!("jm_heartbeat_orderbook_probes_total").increment(1);
-                                tracing::debug!(%nick, "Sent !orderbook probe to non-ping maker");
+                            match router.send_to_peer(nick, frame.clone()) {
+                                SendResult::Ok => {
+                                    metrics::counter!("jm_heartbeat_orderbook_probes_total").increment(1);
+                                    tracing::debug!(%nick, "Sent !orderbook probe to non-ping maker");
+                                }
+                                SendResult::ChannelFull => {
+                                    tracing::warn!(%nick, "Orderbook probe dropped: peer channel full");
+                                }
+                                SendResult::NotFound => {}
                             }
                         }
                     }

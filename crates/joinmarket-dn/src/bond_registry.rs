@@ -25,8 +25,12 @@ impl From<&OutPoint> for OutPointKey {
 
 #[derive(Debug, thiserror::Error)]
 pub enum BondError {
-    #[error("UTXO already claimed by nick '{0}'")]
-    DuplicateUtxo(String),
+    /// The UTXO outpoint is already registered to a different nick.
+    /// The existing nick is intentionally *not* included in `Display` to prevent
+    /// nick enumeration: an adversary who knows a victim's UTXO could otherwise
+    /// probe the bond registry to learn which nick currently holds it.
+    #[error("UTXO outpoint already claimed by another maker")]
+    DuplicateUtxo,
 }
 
 impl Default for FidelityBondRegistry {
@@ -52,7 +56,14 @@ impl FidelityBondRegistry {
 
         if let Some(existing_nick) = maps.utxo_to_nick.get(&key) {
             if existing_nick.as_str() != nick {
-                return Err(BondError::DuplicateUtxo(existing_nick.clone()));
+                // Log at DEBUG only to avoid exposing the existing nick in warn-level
+                // output where an adversary probing with a known UTXO could read it.
+                tracing::debug!(
+                    txid = ?key.txid,
+                    vout = key.vout,
+                    "bond registry: UTXO already claimed by a different nick"
+                );
+                return Err(BondError::DuplicateUtxo);
             }
         }
 
@@ -81,10 +92,17 @@ mod tests {
     use joinmarket_core::fidelity_bond::FidelityBondProof;
 
     fn make_bond_with_vout(vout: u32) -> FidelityBondProof {
+        // Compressed secp256k1 generator point G (valid curve point).
+        let g: [u8; 33] = [
+            0x02, 0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95,
+            0xce, 0x87, 0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59,
+            0xf2, 0x81, 0x5b, 0x16, 0xf8, 0x17, 0x98,
+        ];
         let mut blob = vec![0u8; 252];
+        blob[144..177].copy_from_slice(&g); // cert_pubkey
+        blob[179..212].copy_from_slice(&g); // utxo_pubkey
         // Set vout at offset 72+72+33+2+33+32 = 244
-        let vout_bytes = vout.to_le_bytes();
-        blob[244..248].copy_from_slice(&vout_bytes);
+        blob[244..248].copy_from_slice(&vout.to_le_bytes());
         let encoded = base64::engine::general_purpose::STANDARD.encode(&blob);
         FidelityBondProof::parse_base64(&encoded).unwrap()
     }
@@ -102,7 +120,7 @@ mod tests {
         let bond = make_bond_with_vout(0);
         registry.register_bond("J5nickAAAAAAAA0", &bond).unwrap();
         let err = registry.register_bond("J5nickBBBBBBBB0", &bond).unwrap_err();
-        assert!(matches!(err, BondError::DuplicateUtxo(_)));
+        assert!(matches!(err, BondError::DuplicateUtxo));
     }
 
     #[test]

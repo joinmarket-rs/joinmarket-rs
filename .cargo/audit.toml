@@ -3,13 +3,22 @@
 # Add to CI: cargo audit
 
 [advisories]
-# RUSTSEC-2023-0071 — Marvin Attack in `rsa` crate.
-# No fixed version available upstream. Affects the `arti` feature only
-# (embedded Tor backend). The default `tordaemon` build is not affected.
-# cargo-deny doesn't see it (runs with default features); cargo audit scans
-# the full Cargo.lock and does, so we suppress it here only.
+# All entries below affect the `--features arti` build only.
+# The default `tordaemon` build is unaffected.
+# cargo-deny runs with default features and therefore does not see these
+# advisories; cargo audit scans the full Cargo.lock and does, so we suppress
+# them here only.
 ignore = [
+    # RUSTSEC-2023-0071 — Marvin Attack in `rsa` crate.
+    # No fixed version available upstream.
     "RUSTSEC-2023-0071",
+    # RUSTSEC-2025-0141 — bincode 2.x is unmaintained.
+    # Transitive arti dep (tor-netdir → typed-index-collections → bincode).
+    # No fix available; does not affect any peer-supplied input path.
+    "RUSTSEC-2025-0141",
+    # RUSTSEC-2024-0436 — paste 1.x is unmaintained.
+    # Transitive arti dep (proc-macro, compile-time only; no runtime surface).
+    "RUSTSEC-2024-0436",
 ]
 [output]
 # Vulnerabilities (non-informational) are always hard errors regardless of

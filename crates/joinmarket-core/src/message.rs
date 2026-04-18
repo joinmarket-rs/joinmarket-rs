@@ -15,7 +15,7 @@ pub mod msg_type {
     pub const GETPEERLIST:  u32 = 791;
     pub const HANDSHAKE:    u32 = 793;
     pub const DN_HANDSHAKE: u32 = 795;
-    pub const PING:         u32 = 797;
+    pub const PING:         u32 = 798;
     pub const PONG:         u32 = 799;
     pub const DISCONNECT:   u32 = 801;
 }
@@ -268,7 +268,7 @@ mod tests {
 
     #[test]
     fn test_envelope_only_commands_rejected() {
-        // These are envelope-level types (791, 797, 799, 801), not ! commands
+        // These are envelope-level types (791, 798, 799, 801), not ! commands
         assert!(JmMessage::parse("!getpeers").is_err());
         assert!(JmMessage::parse("!ping").is_err());
         assert!(JmMessage::parse("!pong").is_err());

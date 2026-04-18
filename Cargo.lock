@@ -2303,6 +2303,7 @@ dependencies = [
  "async-trait",
  "data-encoding",
  "futures",
+ "libsqlite3-sys",
  "safelog",
  "sha3",
  "thiserror 1.0.69",
@@ -2427,6 +2428,7 @@ version = "0.36.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "95b4103cffefa72eb8428cb6b47d6627161e51c2739fc5e3b734584157bc642a"
 dependencies = [
+ "cc",
  "pkg-config",
  "vcpkg",
 ]

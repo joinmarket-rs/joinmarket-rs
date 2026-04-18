@@ -20,7 +20,7 @@ The `type` field is an integer discriminator. The `line` field carries the paylo
 | 791 | GETPEERLIST | peer → DN | Request maker list |
 | 793 | HANDSHAKE | peer → DN | Initial handshake |
 | 795 | DN_HANDSHAKE | DN → peer | Handshake response |
-| 797 | PING | DN → peer | Liveness probe |
+| 798 | PING | DN → peer | Liveness probe |
 | 799 | PONG | peer → DN | Liveness response |
 | 801 | DISCONNECT | either | Graceful close |
 
@@ -71,14 +71,14 @@ Peer sends an empty type 791 envelope. DN responds with type 789 containing comm
 
 Disconnected peers may be suffixed with `;D`. Only makers appear in the peer list — takers are never exposed.
 
-## PING / PONG (envelope types 797 / 799)
+## PING / PONG (envelope types 798 / 799)
 
-DN sends type 797 to probe liveness after a peer has been idle for 10 minutes. Peer responds with type 799. Peers that do not respond within 30 seconds are evicted. Peers idle for 25 minutes are hard-evicted without a probe.
+DN sends type 798 to probe liveness after a peer has been idle for 10 minutes. Peer responds with type 799. Peers that do not respond within 30 seconds are evicted. Peers idle for 25 minutes are hard-evicted without a probe.
 
 Python JoinMarket clients that do not support PING/PONG are probed differently: the DN sends them a unicast `!orderbook` PUBMSG, which prompts the maker to re-announce its offers. Receiving those offer pubmsgs updates the maker's idle timer. Non-ping takers receive no probe and are hard-evicted at 15 minutes if silent.
 
 ```
-← {"type": 797, "line": ""}
+← {"type": 798, "line": ""}
 → {"type": 799, "line": ""}
 ```
 

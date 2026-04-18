@@ -701,7 +701,7 @@ Three-step liveness sweep every minute. Clears zombie connections that TCP keepa
 **Algorithm (each sweep):**
 1. **Hard-evict** peers idle >25 min (no probe — they are assumed dead)
 2. **Probe** peers idle >10 min, branching on capability:
-   - **Ping-capable peers**: send PING (envelope type 797); wait 30 s; evict non-responders.
+   - **Ping-capable peers**: send PING (envelope type 798); wait 30 s; evict non-responders.
    - **Non-ping makers** (Python JoinMarket clients): send a unicast `!orderbook` PUBMSG. The maker responds with offer privmsgs which flow through the normal receive path, updating `last_seen`. No explicit timeout — hard eviction at 25 min covers non-responders.
    - **Non-ping takers**: no probe; hard-evicted at 25 min if silent.
 3. **Wait 30 seconds**, then evict ping-capable peers that did not respond with PONG (type 799)

@@ -239,7 +239,7 @@ async fn test_ping_pong() {
     taker_handshake(&mut reader, &mut writer, NICK_PING).await;
     tokio::time::sleep(Duration::from_millis(30)).await;
 
-    // Send ping (type=797), expect pong (type=799)
+    // Send ping (type=798), expect pong (type=799)
     let ping = OnionEnvelope::new(msg_type::PING, "").serialize();
     writer.write_all(ping.as_bytes()).await.unwrap();
     writer.flush().await.unwrap();

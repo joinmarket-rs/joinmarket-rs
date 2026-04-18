@@ -80,7 +80,7 @@
 1. Assert public commands (`!sw0absoffer`, `!orderbook`, `!hp2`, `!cancel`, `!tbond`) are broadcast to all connected peers
 1. Assert `GETPEERLIST` (envelope type 791) returns only the Maker
 1. Assert PRIVMSG routing forwards to the target peer
-1. Assert PING / PONG (envelope types 797/799) heartbeat clears disconnected peers
+1. Assert PING / PONG (envelope types 798/799) heartbeat clears disconnected peers
 
 ### Fuzz tests (planned)
 

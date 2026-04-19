@@ -67,3 +67,6 @@ joinmarket-dn.db
 
 # Docs build output
 docs/_build/
+
+# Git worktrees
+.worktrees/

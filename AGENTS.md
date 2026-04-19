@@ -81,6 +81,7 @@ cargo test --workspace -- --nocapture
 ## Workspace Layout
 
 ```
+.worktrees/          # Git worktree storage; create new git worktrees here
 crates/
   joinmarket-core/   # Pure protocol library — no I/O, no async
   joinmarket-tor/    # TorProvider trait + backends (tordaemon | arti), MockTorProvider
@@ -88,6 +89,11 @@ crates/
 docs/                # Architecture, protocol, deployment, development docs
 tests/fixtures/      # Reference JoinMarket wire payloads
 ```
+
+## Git Worktrees
+
+- Create all project git worktrees under `.worktrees/`.
+- Do not create sibling or ad hoc worktree directories elsewhere in repo.
 
 ---
 
@@ -370,3 +376,4 @@ considering the work done:
 
 Both workspace trees must stay in sync with the actual filesystem. Never let a file exist on disk
 without a corresponding entry in the trees, and never leave a tree entry that no longer exists on disk.
+Include `.worktrees/` in workspace trees when documenting repo layout.

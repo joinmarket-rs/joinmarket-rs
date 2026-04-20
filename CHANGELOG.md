@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Other
+
+- docs(readme): correct PING envelope type
+- docs(repo): document .worktrees location for git worktrees
+- feat(dn): add peerlist feature advertisement
+- fix(dn): validate feature names in peerlist flow
+- chore(arti): upgrade Arti deps and tighten operator guidance
+- ci(github): add workspace CI workflow
+- ci(arti): extend CI coverage beyond compile checks
+
 ## [0.2.0-alpha] - 2026-04-08
 
 ### Added
@@ -29,6 +41,8 @@ All notable changes to this project will be documented in this file.
 - fix(dn): harden admission, fix race conditions, and improve correctness
 - fix(dn): increase peer channel capacity and distinguish drop reasons
 - fix(dn): harden peer lifecycle, routing, and admission correctness
+- chore(release): prepare v0.2.0-alpha
+- fix(ci): bundle libsqlite3-sys for arti cross-compilation and allow workflow_dispatch
 
 ### Removed
 

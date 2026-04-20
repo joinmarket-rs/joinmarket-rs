@@ -2136,7 +2136,7 @@ dependencies = [
 
 [[package]]
 name = "joinmarket-core"
-version = "0.2.0-alpha"
+version = "0.3.0-alpha"
 dependencies = [
  "base64",
  "bitcoin_hashes 0.13.1",
@@ -2158,7 +2158,7 @@ dependencies = [
 
 [[package]]
 name = "joinmarket-dn"
-version = "0.2.0-alpha"
+version = "0.3.0-alpha"
 dependencies = [
  "anyhow",
  "base64",
@@ -2181,7 +2181,7 @@ dependencies = [
 
 [[package]]
 name = "joinmarket-tor"
-version = "0.2.0-alpha"
+version = "0.3.0-alpha"
 dependencies = [
  "anyhow",
  "arti-client",

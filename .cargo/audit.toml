@@ -24,8 +24,8 @@ ignore = [
 ]
 [output]
 # Vulnerabilities (non-informational) are always hard errors regardless of
-# this list. We do not add "yanked" here because unicode-segmentation 1.13.0
-# is a yanked arti-only transitive dep that cannot be selectively suppressed
-# via cargo-audit's config; it is monitored via `cargo deny check advisories`.
+# this list. We do not add "yanked" here because cargo-audit cannot
+# selectively suppress yanked crates; those are monitored via
+# `cargo deny check advisories`.
 deny = []
 quiet = false

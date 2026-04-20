@@ -30,7 +30,7 @@ jobs:
         run: cargo test --workspace
 
   arti-check:
-    name: Arti feature compile check
+    name: Arti feature build and test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -40,6 +40,12 @@ jobs:
 
       - name: Cargo check (arti)
         run: cargo check --workspace --no-default-features --features joinmarket-dn/arti
+
+      - name: Cargo test (joinmarket-tor, arti)
+        run: cargo test -p joinmarket-tor --no-default-features --features arti
+
+      - name: Cargo test (joinmarket-dn, arti)
+        run: cargo test -p joinmarket-dn --no-default-features --features arti
 
   security-audit:
     name: cargo-audit and cargo-deny

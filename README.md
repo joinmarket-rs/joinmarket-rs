@@ -121,7 +121,10 @@ cargo build --release \
   --features joinmarket-dn/arti
 ```
 
-Then activate PoW at runtime with `--pow`:
+Then activate PoW at runtime with `--pow`.
+
+> **CI assurance note:** the default `tordaemon` path receives the full workspace lint/test suite. The optional `arti` path is covered separately in CI with a dedicated build check plus Arti-feature test runs for `joinmarket-tor` and `joinmarket-dn`, but it remains the lower-assurance and non-preferred production backend while upstream Arti advisories remain open.
+
 
 ```bash
 joinmarket-dn --pow "My PoW-protected directory node"

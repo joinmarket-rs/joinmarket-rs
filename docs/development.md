@@ -60,6 +60,16 @@
 
 ## Testing Strategy
 
+### CI coverage expectations
+
+The workspace uses split CI jobs because `tordaemon` and `arti` are mutually exclusive backends and must not be enabled with `--all-features`.
+
+Current expectations:
+
+- **Default `tordaemon` path:** full workspace lint and test coverage
+- **Optional `arti` path:** dedicated `cargo check` plus Arti-feature test runs for `joinmarket-tor` and `joinmarket-dn`
+- **Production posture:** despite that CI coverage, `arti` remains the lower-assurance backend until upstream dependency advisories are fully cleared
+
 ### Unit tests (in `joinmarket-core`)
 
 - Nick construction: known pubkey → known nick string (cross-check against Python test vectors)

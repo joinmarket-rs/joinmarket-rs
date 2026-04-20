@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.3.0-alpha] - 2026-04-20
 
 ### Other
 
@@ -13,8 +13,8 @@ All notable changes to this project will be documented in this file.
 - chore(arti): upgrade Arti deps and tighten operator guidance
 - ci(github): add workspace CI workflow
 - ci(arti): extend CI coverage beyond compile checks
-- chore(release): prepare v0.3.0-alpha
 - fix(joinmarket-dn): report binary version at startup
+- chore(release): prepare v0.3.0-alpha
 
 ## [0.2.0-alpha] - 2026-04-08
 

@@ -42,6 +42,7 @@ The `type` field is an integer discriminator. The `line` field carries the paylo
 
 - `location-string`: `"onion:port"` for makers, `""` or `"NOT-SERVING-ONION"` for takers
 - `features` may contain `"fidelity_bond"` (base64-encoded 252-byte proof)
+- peers may advertise capability booleans such as `"ping": true` and `"peerlist_features": true`
 
 ### DN → Peer (type 795)
 
@@ -52,7 +53,7 @@ The `type` field is an integer discriminator. The `line` field carries the paylo
   "location-string": "abcdef1234567890.onion:5222",
   "proto-ver-min": 5,
   "proto-ver-max": 5,
-  "features": {},
+  "features": {"ping": true, "peerlist_features": true},
   "accepted": true,
   "nick": "J5dirNickOOOOOOO",
   "network": "mainnet",
@@ -62,14 +63,21 @@ The `type` field is an integer discriminator. The `line` field carries the paylo
 
 ## GETPEERLIST / PEERLIST exchange (envelope types 791 / 789)
 
-Peer sends an empty type 791 envelope. DN responds with type 789 containing comma-separated `nick;location` pairs:
+Peer sends an empty type 791 envelope. DN responds with type 789 containing comma-separated peerlist entries. Legacy recipients receive `nick;location` pairs:
 
 ```
 → {"type": 791, "line": ""}
 ← {"type": 789, "line": "J5dir;dir.onion:5222,J5maker;maker.onion:5222"}
 ```
 
-Disconnected peers may be suffixed with `;D`. Only makers appear in the peer list — takers are never exposed.
+Recipients that advertised `"peerlist_features": true` receive the extended format, where `F:` is the final semicolon-delimited field and contains alphabetically sorted `+`-separated feature names preserved from the peer's handshake:
+
+```
+→ {"type": 791, "line": ""}
+← {"type": 789, "line": "J5dir;dir.onion:5222;F:peerlist_features+ping,J5maker;maker.onion:5222;F:peerlist_features+ping+zeta"}
+```
+
+Disconnected peers may be suffixed with `;D`. Disconnect notifications remain plain and include the directory entry, e.g. `nick;location;D,dn_nick;dn_location`. Only makers appear in GETPEERLIST responses — takers are never exposed.
 
 ## PING / PONG (envelope types 798 / 799)
 
@@ -122,7 +130,7 @@ The DN broadcasts all recognised public commands to every connected peer via a s
 | `!error` | Error notification |
 | `!hp2` | Commitment transfer (private) |
 
-The DN relays PRIVMSG envelopes opaquely to the target peer without parsing the inner command. It also sends a PEERLIST (type 789) containing the sender's onion address to the target, enabling direct peer-to-peer connection.
+The DN relays PRIVMSG envelopes opaquely to the target peer without parsing the inner command. It also sends a PEERLIST (type 789) containing the sender's onion address to the target, enabling direct peer-to-peer connection. If the recipient advertised `peerlist_features`, that peerlist uses the same extended `F:` suffix format described above.
 
 ## Private message routing
 
@@ -135,6 +143,9 @@ DN forwards PRIVMSG to maker:
 
 DN also sends PEERLIST with taker's location to maker:
   {"type": 789, "line": "J5taker;taker.onion:5222,J5dir;dir.onion:5222"}
+
+If maker advertised `peerlist_features`, DN may instead send:
+  {"type": 789, "line": "J5taker;taker.onion:5222;F:ping+weird,J5dir;dir.onion:5222;F:peerlist_features+ping"}
 
 Maker can then connect directly to taker.onion:5222 for subsequent negotiation.
 ```

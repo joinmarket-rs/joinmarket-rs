@@ -82,12 +82,32 @@ impl PeerHandshake {
             .and_then(|s| crate::fidelity_bond::FidelityBondProof::parse_base64(s).ok())
     }
 
+    /// Returns the names of all features explicitly advertised as JSON boolean
+    /// `true`, sorted alphabetically for deterministic output.
+    pub fn advertised_true_features(&self) -> Vec<String> {
+        let mut features: Vec<String> = self.features
+            .iter()
+            .filter_map(|(name, value)| value.as_bool().filter(|b| *b).map(|_| name.clone()))
+            .collect();
+        features.sort_unstable();
+        features
+    }
+
     /// Returns true if the peer advertised `!ping`/`!pong` heartbeat support via
     /// `"features": {"ping": true}` in their handshake. Python clients never set
     /// this, so it defaults to false.
     pub fn supports_ping(&self) -> bool {
         self.features
             .get("ping")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+
+    /// Returns true if the peer advertised support for extended PEERLIST entries
+    /// via `"features": {"peerlist_features": true}` in their handshake.
+    pub fn supports_peerlist_features(&self) -> bool {
+        self.features
+            .get("peerlist_features")
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
     }
@@ -150,6 +170,13 @@ impl DnHandshake {
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).expect("infallible")
     }
+}
+
+pub fn dn_supported_features() -> HashMap<String, serde_json::Value> {
+    HashMap::from([
+        ("peerlist_features".to_string(), serde_json::Value::Bool(true)),
+        ("ping".to_string(), serde_json::Value::Bool(true)),
+    ])
 }
 
 
@@ -313,6 +340,42 @@ mod tests {
         let err = PeerHandshake::parse_json(&json).unwrap_err();
         assert!(matches!(err, HandshakeError::FieldTooLong),
             "expected FieldTooLong, got {:?}", err);
+    }
+
+    #[test]
+    fn test_advertised_true_features_preserves_unknown_and_sorts() {
+        let json = r#"{"app-name":"joinmarket","directory":false,"location-string":"","proto-ver":5,"features":{"zeta":true,"ping":true,"alpha":true},"nick":"J5xhGSWE7VrxM7sO","network":"mainnet"}"#;
+        let msg = PeerHandshake::parse_json(json).unwrap();
+        assert_eq!(
+            msg.advertised_true_features(),
+            vec!["alpha".to_string(), "ping".to_string(), "zeta".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_advertised_true_features_ignores_non_boolean_true_values() {
+        let json = r#"{"app-name":"joinmarket","directory":false,"location-string":"","proto-ver":5,"features":{"ping":true,"falsey":false,"stringy":"true","numbery":1,"nullish":null},"nick":"J5xhGSWE7VrxM7sO","network":"mainnet"}"#;
+        let msg = PeerHandshake::parse_json(json).unwrap();
+        assert_eq!(msg.advertised_true_features(), vec!["ping".to_string()]);
+    }
+
+    #[test]
+    fn test_supports_peerlist_features() {
+        let json = r#"{"app-name":"joinmarket","directory":false,"location-string":"","proto-ver":5,"features":{"peerlist_features":true},"nick":"J5xhGSWE7VrxM7sO","network":"mainnet"}"#;
+        let msg = PeerHandshake::parse_json(json).unwrap();
+        assert!(msg.supports_peerlist_features());
+        assert!(!msg.supports_ping());
+    }
+
+    #[test]
+    fn test_dn_supported_features() {
+        let features = dn_supported_features();
+        assert_eq!(features.get("ping"), Some(&serde_json::Value::Bool(true)));
+        assert_eq!(
+            features.get("peerlist_features"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(features.len(), 2);
     }
 
 }

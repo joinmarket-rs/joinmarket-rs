@@ -768,6 +768,7 @@ jm_broadcast_lag_evictions_total           counter
 1. Look up `target_nick` in Router via `locate_peer()` → get their onion address
 1. Forward the PRIVMSG envelope to the target peer
 1. Send a PEERLIST (type 789) to the target containing the sender's onion address, enabling direct peer-to-peer connection
+1. If the recipient advertised `peerlist_features`, append an `F:` suffix containing the sender's advertised true-valued features; DN's own entry advertises `peerlist_features+ping`
 
 ### `GETPEERLIST` request (envelope type 791)
 
@@ -775,7 +776,8 @@ jm_broadcast_lag_evictions_total           counter
 1. Call `router.get_peers_response()`
 1. If `≤20,000` makers: return full list
 1. If `>20,000` makers: return random sample of ~4,000 with metadata
-1. Respond with PEERLIST (envelope type 789) containing comma-separated `nick;location` pairs
+1. If requester advertised `peerlist_features`, serialise entries as `nick;location;F:feature1+feature2` with alphabetically sorted preserved feature names; otherwise use legacy `nick;location`
+1. DN's own peerlist entry advertises `peerlist_features+ping`
 
 ---
 

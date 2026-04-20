@@ -218,8 +218,8 @@ Routing is driven by **envelope types** (integer discriminators), not `!`-prefix
 | Envelope type | Behaviour |
 |---------------|-----------|
 | `PUBMSG` (687) | Broadcast to all connected peers (carries `!`-prefixed application commands like `!sw0absoffer`, `!orderbook`) |
-| `PRIVMSG` (685) | Forward to the target peer; DN also sends the sender's onion address to the target via `PEERLIST` |
-| `GETPEERLIST` (791) | Return full maker list (≤20k) or bond-weighted sample (>20k) as a `PEERLIST` (789) response |
+| `PRIVMSG` (685) | Forward to the target peer; DN also sends the sender's onion address to the target via `PEERLIST` (optionally extended with `F:` feature suffixes for capable recipients) |
+| `GETPEERLIST` (791) | Return full maker list (≤20k) or bond-weighted sample (>20k) as a `PEERLIST` (789) response; recipients advertising `peerlist_features` receive `F:` feature suffixes |
 | `PING` (798) | DN sends liveness probe; peer replies with `PONG` (799) |
 | `DISCONNECT` (801) | Close connection cleanly |
 

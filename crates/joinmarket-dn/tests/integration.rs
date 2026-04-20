@@ -19,6 +19,7 @@ use joinmarket_tor::mock::MockTorProvider;
 
 const TEST_ONION: &str = "2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion";
 const MAKER_ONION: &str = "2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion:5222";
+const ALT_MAKER_ONION: &str = "coinjointovy3eq5fjygdwpkbcdx63d7vd4g32mw7y553uj3kjjzkiqd.onion:5222";
 
 /// All nicks must be exactly 16 chars, start with 'J', and have valid base58 in pos 2+.
 const NICK_MAKER: &str = "J5testMakerOOOOO";  // 16 chars
@@ -86,11 +87,11 @@ async fn read_envelope(reader: &mut BufReader<tokio::io::ReadHalf<TcpStream>>) -
 }
 
 /// Build a peer handshake JSON string (inner payload, not yet envelope-wrapped).
-fn peer_handshake_json(nick: &str, location_string: &str) -> String {
+fn peer_handshake_json_with_features(nick: &str, location_string: &str, features_json: &str) -> String {
     format!(
         "{{\"app-name\":\"joinmarket\",\"directory\":false,\
          \"location-string\":\"{location_string}\",\
-         \"proto-ver\":5,\"features\":{{}},\"nick\":\"{nick}\",\
+         \"proto-ver\":5,\"features\":{features_json},\"nick\":\"{nick}\",\
          \"network\":\"mainnet\"}}"
     )
 }
@@ -102,20 +103,30 @@ fn wrap_in_handshake_envelope(payload_json: &str) -> String {
 
 /// Send the peer's handshake (type=793) and read the directory's response (type=795).
 /// Returns the directory's DnHandshake envelope.
-async fn do_handshake(
+async fn do_handshake_with_features(
     reader: &mut BufReader<tokio::io::ReadHalf<TcpStream>>,
     writer: &mut tokio::io::WriteHalf<TcpStream>,
     nick: &str,
     location_string: &str,
+    features_json: &str,
 ) -> OnionEnvelope {
     // Peer sends first
-    let hs_json = peer_handshake_json(nick, location_string);
+    let hs_json = peer_handshake_json_with_features(nick, location_string, features_json);
     let envelope = wrap_in_handshake_envelope(&hs_json);
     writer.write_all(envelope.as_bytes()).await.unwrap();
     writer.flush().await.unwrap();
 
     // Read directory's type=795 response
     read_envelope(reader).await.expect("expected DN handshake response (type=795)")
+}
+
+async fn do_handshake(
+    reader: &mut BufReader<tokio::io::ReadHalf<TcpStream>>,
+    writer: &mut tokio::io::WriteHalf<TcpStream>,
+    nick: &str,
+    location_string: &str,
+) -> OnionEnvelope {
+    do_handshake_with_features(reader, writer, nick, location_string, "{}").await
 }
 
 /// Maker handshake: has a location-string → registered as maker.
@@ -127,6 +138,15 @@ async fn maker_handshake(
     do_handshake(reader, writer, nick, MAKER_ONION).await
 }
 
+async fn maker_handshake_with_features(
+    reader: &mut BufReader<tokio::io::ReadHalf<TcpStream>>,
+    writer: &mut tokio::io::WriteHalf<TcpStream>,
+    nick: &str,
+    features_json: &str,
+) -> OnionEnvelope {
+    do_handshake_with_features(reader, writer, nick, MAKER_ONION, features_json).await
+}
+
 /// Taker handshake: empty location-string → registered as taker.
 async fn taker_handshake(
     reader: &mut BufReader<tokio::io::ReadHalf<TcpStream>>,
@@ -134,6 +154,15 @@ async fn taker_handshake(
     nick: &str,
 ) -> OnionEnvelope {
     do_handshake(reader, writer, nick, "").await
+}
+
+async fn taker_handshake_with_features(
+    reader: &mut BufReader<tokio::io::ReadHalf<TcpStream>>,
+    writer: &mut tokio::io::WriteHalf<TcpStream>,
+    nick: &str,
+    features_json: &str,
+) -> OnionEnvelope {
+    do_handshake_with_features(reader, writer, nick, "", features_json).await
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -175,6 +204,24 @@ async fn test_handshake_taker_registers() {
 }
 
 #[tokio::test]
+async fn test_dn_handshake_advertises_ping_and_peerlist_features() {
+    let (tor, _router, shutdown) = start_test_server().await;
+
+    let (mut reader, mut writer) = connect_to_server(&tor).await;
+    let dn_resp = taker_handshake(&mut reader, &mut writer, NICK_TAKER).await;
+
+    assert_eq!(dn_resp.msg_type, msg_type::DN_HANDSHAKE);
+    assert!(dn_resp.line.contains("\"ping\":true"), "DN response: {}", dn_resp.line);
+    assert!(
+        dn_resp.line.contains("\"peerlist_features\":true"),
+        "DN response: {}",
+        dn_resp.line
+    );
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
 async fn test_getpeers_returns_only_makers() {
     let (tor, _router, shutdown) = start_test_server().await;
 
@@ -198,6 +245,46 @@ async fn test_getpeers_returns_only_makers() {
     assert_eq!(response.msg_type, msg_type::PEERLIST, "expected peerlist, got: {:?}", response);
     assert!(response.line.contains(NICK_MAKER_A), "maker should be in peers response: {}", response.line);
     assert!(!response.line.contains(NICK_TAKER_A), "taker should NOT be in peers response: {}", response.line);
+    assert!(!response.line.contains(";F:"), "legacy requester should not receive feature suffixes: {}", response.line);
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn test_getpeerlist_extended_preserves_unknown_features() {
+    let (tor, _router, shutdown) = start_test_server().await;
+
+    let (mut maker_r, mut maker_w) = connect_to_server(&tor).await;
+    maker_handshake_with_features(
+        &mut maker_r,
+        &mut maker_w,
+        NICK_MAKER_A,
+        r#"{"ping":true,"zeta":true,"peerlist_features":true}"#,
+    ).await;
+
+    let (mut taker_r, mut taker_w) = connect_to_server(&tor).await;
+    taker_handshake_with_features(
+        &mut taker_r,
+        &mut taker_w,
+        NICK_TAKER_A,
+        r#"{"peerlist_features":true}"#,
+    ).await;
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let req = OnionEnvelope::new(msg_type::GETPEERLIST, "").serialize();
+    taker_w.write_all(req.as_bytes()).await.unwrap();
+    taker_w.flush().await.unwrap();
+
+    let response = read_envelope(&mut taker_r).await.expect("expected peerlist response");
+    assert_eq!(response.msg_type, msg_type::PEERLIST);
+    assert!(
+        response.line.contains(&format!("{};{};F:peerlist_features+ping+zeta", NICK_MAKER_A, MAKER_ONION)),
+        "extended peerlist missing maker features: {}",
+        response.line
+    );
+    assert!(response.line.contains(";F:peerlist_features+ping"), "DN entry missing features: {}", response.line);
+    assert!(!response.line.contains(NICK_TAKER_A), "taker should not be in peerlist: {}", response.line);
 
     shutdown.cancel();
 }
@@ -457,6 +544,49 @@ async fn test_privmsg_forwarded_to_target() {
 }
 
 #[tokio::test]
+async fn test_privmsg_peerlist_uses_extended_format_for_capable_recipient() {
+    let (tor, _router, shutdown) = start_test_server().await;
+
+    let (mut maker_r, mut maker_w) = connect_to_server(&tor).await;
+    maker_handshake_with_features(
+        &mut maker_r,
+        &mut maker_w,
+        NICK_MAKER_A,
+        r#"{"peerlist_features":true}"#,
+    ).await;
+
+    let (mut taker_r, mut taker_w) = connect_to_server(&tor).await;
+    do_handshake_with_features(
+        &mut taker_r,
+        &mut taker_w,
+        NICK_TAKER_A,
+        ALT_MAKER_ONION,
+        r#"{"ping":true,"weird":true}"#,
+    ).await;
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let privmsg_line = format!("{}!{}!!fill 1000000 abc", NICK_TAKER_A, NICK_MAKER_A);
+    let privmsg_env = OnionEnvelope::new(msg_type::PRIVMSG, privmsg_line).serialize();
+    taker_w.write_all(privmsg_env.as_bytes()).await.unwrap();
+    taker_w.flush().await.unwrap();
+
+    let maker_msg = read_envelope(&mut maker_r).await.expect("maker should receive privmsg");
+    assert_eq!(maker_msg.msg_type, msg_type::PRIVMSG);
+
+    let peerlist_msg = read_envelope(&mut maker_r).await.expect("maker should receive peerlist");
+    assert_eq!(peerlist_msg.msg_type, msg_type::PEERLIST);
+    assert!(
+        peerlist_msg.line.contains(&format!("{};{};F:ping+weird", NICK_TAKER_A, ALT_MAKER_ONION)),
+        "sender features missing from privmsg peerlist: {}",
+        peerlist_msg.line
+    );
+    assert!(peerlist_msg.line.contains(";F:peerlist_features+ping"), "DN features missing: {}", peerlist_msg.line);
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
 async fn test_disconnect_notification() {
     let (tor, router, shutdown) = start_test_server().await;
 
@@ -480,6 +610,8 @@ async fn test_disconnect_notification() {
     assert_eq!(disconnect_msg.msg_type, msg_type::PEERLIST, "expected PEERLIST disconnect notification, got: {:?}", disconnect_msg);
     assert!(disconnect_msg.line.contains(";D"), "disconnect entry should have ;D suffix: {}", disconnect_msg.line);
     assert!(disconnect_msg.line.contains(NICK_MAKER_A), "disconnect should reference maker nick: {}", disconnect_msg.line);
+    assert!(disconnect_msg.line.contains(","), "disconnect notification should include DN entry: {}", disconnect_msg.line);
+    assert!(!disconnect_msg.line.contains(";F:"), "disconnect notification must stay plain: {}", disconnect_msg.line);
 
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert_eq!(router.maker_count(), 0);

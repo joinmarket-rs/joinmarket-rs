@@ -64,11 +64,58 @@ pub struct PeersResponse {
     pub request_more: bool,
 }
 
+const FEATURE_FLAG_PING: u8 = 0b0000_0001;
+const FEATURE_FLAG_PEERLIST_FEATURES: u8 = 0b0000_0010;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupportedFeatures {
+    known_flags: u8,
+    advertised_sorted: Arc<[Arc<str>]>,
+}
+
+impl SupportedFeatures {
+    pub fn new(advertised_true_features: Vec<String>) -> Self {
+        let mut known_flags = 0u8;
+        let mut advertised_sorted: Vec<Arc<str>> = advertised_true_features
+            .into_iter()
+            .map(|feature| {
+                match feature.as_str() {
+                    "ping" => known_flags |= FEATURE_FLAG_PING,
+                    "peerlist_features" => known_flags |= FEATURE_FLAG_PEERLIST_FEATURES,
+                    _ => {}
+                }
+                Arc::<str>::from(feature)
+            })
+            .collect();
+        advertised_sorted.sort_unstable_by(|a, b| a.as_ref().cmp(b.as_ref()));
+        SupportedFeatures {
+            known_flags,
+            advertised_sorted: advertised_sorted.into(),
+        }
+    }
+
+    pub fn supports_ping(&self) -> bool {
+        self.known_flags & FEATURE_FLAG_PING != 0
+    }
+
+    pub fn supports_peerlist_features(&self) -> bool {
+        self.known_flags & FEATURE_FLAG_PEERLIST_FEATURES != 0
+    }
+
+    pub fn advertised(&self) -> Arc<[Arc<str>]> {
+        self.advertised_sorted.clone()
+    }
+
+    pub fn empty() -> Self {
+        Self::new(Vec::new())
+    }
+}
+
 /// Consolidated per-peer metadata stored in a single DashMap.
 struct PeerMeta {
     shutdown: CancellationToken,
     probe_tx: mpsc::Sender<Arc<str>>,
-    supports_ping: bool,
+    supported_features: SupportedFeatures,
     is_maker: bool,
     last_seen: Instant,
     pong_pending: bool,
@@ -272,13 +319,13 @@ impl Router {
         nick: &Arc<str>,
         token: CancellationToken,
         probe_tx: mpsc::Sender<Arc<str>>,
-        ping_capable: bool,
+        supported_features: SupportedFeatures,
         is_maker: bool,
     ) {
         self.peer_meta.insert(nick.clone(), PeerMeta {
             shutdown: token,
             probe_tx,
-            supports_ping: ping_capable,
+            supported_features,
             is_maker,
             last_seen: Instant::now(),
             pong_pending: false,
@@ -297,7 +344,11 @@ impl Router {
         self.peer_meta
             .iter()
             .filter(|e| e.value().last_seen.elapsed() >= threshold)
-            .map(|e| (e.key().clone(), e.value().supports_ping, e.value().is_maker))
+            .map(|e| (
+                e.key().clone(),
+                e.value().supported_features.supports_ping(),
+                e.value().is_maker,
+            ))
             .collect()
     }
 
@@ -394,6 +445,16 @@ impl Router {
             });
         metrics::histogram!("jm_router_locate_duration_seconds").record(start.elapsed().as_secs_f64());
         result
+    }
+
+    pub fn peer_supports_peerlist_features(&self, nick: &str) -> bool {
+        self.peer_meta.get(nick)
+            .is_some_and(|meta| meta.supported_features.supports_peerlist_features())
+    }
+
+    pub fn peer_advertised_features(&self, nick: &str) -> Option<Arc<[Arc<str>]>> {
+        self.peer_meta.get(nick)
+            .map(|meta| meta.supported_features.advertised())
     }
 
     /// Broadcast to all connected peers (makers and takers).
@@ -498,7 +559,13 @@ mod tests {
         let router = Router::new();
         let nick: Arc<str> = "J5testNickOOOOOO".into();
         let (tx, _rx) = mpsc::channel::<Arc<str>>(16);
-        router.register_peer_meta(&nick, CancellationToken::new(), tx, true, false);
+        router.register_peer_meta(
+            &nick,
+            CancellationToken::new(),
+            tx,
+            SupportedFeatures::new(vec!["ping".to_string()]),
+            false,
+        );
 
         router.add_pong_pending("J5testNickOOOOOO");
         assert!(router.peer_meta.get("J5testNickOOOOOO").unwrap().pong_pending);
@@ -512,7 +579,13 @@ mod tests {
         let router = Router::new();
         let nick: Arc<str> = "J5testNickOOOOOO".into();
         let (tx, _rx) = mpsc::channel::<Arc<str>>(16);
-        router.register_peer_meta(&nick, CancellationToken::new(), tx, false, false);
+        router.register_peer_meta(
+            &nick,
+            CancellationToken::new(),
+            tx,
+            SupportedFeatures::empty(),
+            false,
+        );
 
         // last_seen should be initialised and fresh
         assert!(router.peer_meta.get("J5testNickOOOOOO")
@@ -524,6 +597,46 @@ mod tests {
     }
 
     #[test]
+    fn test_supported_features_preserve_unknown_and_known_flags() {
+        let features = SupportedFeatures::new(vec![
+            "peerlist_features".to_string(),
+            "ping".to_string(),
+            "zeta".to_string(),
+        ]);
+
+        assert!(features.supports_ping());
+        assert!(features.supports_peerlist_features());
+        assert_eq!(
+            features.advertised().iter().map(|f| f.as_ref()).collect::<Vec<_>>(),
+            vec!["peerlist_features", "ping", "zeta"]
+        );
+    }
+
+    #[test]
+    fn test_peer_feature_lookup_helpers() {
+        let router = Router::new();
+        let nick: Arc<str> = "J5testNickOOOOOO".into();
+        let (tx, _rx) = mpsc::channel::<Arc<str>>(16);
+        router.register_peer_meta(
+            &nick,
+            CancellationToken::new(),
+            tx,
+            SupportedFeatures::new(vec!["peerlist_features".to_string(), "unknown".to_string()]),
+            false,
+        );
+
+        assert!(router.peer_supports_peerlist_features("J5testNickOOOOOO"));
+        assert_eq!(
+            router.peer_advertised_features("J5testNickOOOOOO")
+                .unwrap()
+                .iter()
+                .map(|f| f.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["peerlist_features", "unknown"]
+        );
+    }
+
+    #[test]
     fn test_collect_peers_for_probe_returns_idle() {
         let router = Router::new();
         let nick: Arc<str> = "J5testNickOOOOOO".into();
@@ -531,7 +644,7 @@ mod tests {
         router.peer_meta.insert(nick.clone(), PeerMeta {
             shutdown: CancellationToken::new(),
             probe_tx: tx,
-            supports_ping: false,
+            supported_features: SupportedFeatures::empty(),
             is_maker: false,
             last_seen: Instant::now() - Duration::from_secs(65),
             pong_pending: false,
@@ -553,7 +666,7 @@ mod tests {
         router.peer_meta.insert(nick.clone(), PeerMeta {
             shutdown: token.clone(),
             probe_tx: tx,
-            supports_ping: false,
+            supported_features: SupportedFeatures::empty(),
             is_maker: false,
             last_seen: Instant::now() - Duration::from_secs(700),
             pong_pending: false,
@@ -574,7 +687,7 @@ mod tests {
         router.peer_meta.insert(nick.clone(), PeerMeta {
             shutdown: CancellationToken::new(),
             probe_tx: tx,
-            supports_ping: false,
+            supported_features: SupportedFeatures::empty(),
             is_maker: false,
             last_seen: Instant::now(),
             pong_pending: false,
@@ -594,7 +707,7 @@ mod tests {
         router.peer_meta.insert(nick.clone(), PeerMeta {
             shutdown: CancellationToken::new(),
             probe_tx: tx,
-            supports_ping: false,
+            supported_features: SupportedFeatures::empty(),
             is_maker: false,
             last_seen: Instant::now(),
             pong_pending: false,
@@ -623,7 +736,7 @@ mod tests {
         router.peer_meta.insert(nick.clone(), PeerMeta {
             shutdown: token.clone(),
             probe_tx: tx,
-            supports_ping: true,
+            supported_features: SupportedFeatures::new(vec!["ping".to_string()]),
             is_maker: false,
             last_seen: Instant::now(),
             pong_pending: true,  // ping was sent, awaiting pong
@@ -650,7 +763,7 @@ mod tests {
         router.peer_meta.insert(nick.clone(), PeerMeta {
             shutdown: token.clone(),
             probe_tx: tx,
-            supports_ping: true,
+            supported_features: SupportedFeatures::new(vec!["ping".to_string()]),
             is_maker: false,
             last_seen: Instant::now(),
             pong_pending: true,  // ping was sent, no pong received

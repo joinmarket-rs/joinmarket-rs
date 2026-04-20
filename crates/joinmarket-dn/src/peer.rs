@@ -1,10 +1,11 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
-use joinmarket_core::handshake::{PeerHandshake, DnHandshake, HandshakeError, CURRENT_PROTO_VER};
+use joinmarket_core::handshake::{
+    DnHandshake, HandshakeError, PeerHandshake, CURRENT_PROTO_VER, dn_supported_features,
+};
 use joinmarket_core::message::{
     OnionEnvelope, msg_type,
     parse_pubmsg_line, parse_privmsg_line,
@@ -13,7 +14,9 @@ use joinmarket_core::message::{
 use joinmarket_core::onion::OnionServiceAddr;
 use joinmarket_tor::provider::{BoxReader, BoxWriter};
 
-use crate::router::{Router, MakerInfo, TakerInfo, SendResult, PEER_CHANNEL_CAPACITY};
+use crate::router::{
+    MakerInfo, Router, SendResult, SupportedFeatures, TakerInfo, PEER_CHANNEL_CAPACITY,
+};
 use crate::admission::AdmissionController;
 
 /// Python JoinMarket uses MAX_LENGTH = 40000 in its LineReceiver.
@@ -294,6 +297,7 @@ pub async fn handle_peer(
     let nick: Arc<str> = peer_handshake.nick.clone().into();
     let is_maker = peer_role == PeerRole::Maker;
     let bond = peer_handshake.fidelity_bond();
+    let supported_features = SupportedFeatures::new(peer_handshake.advertised_true_features());
 
     // Admission control — all peers run layers 1 and 4 (nick uniqueness + capacity);
     // makers additionally run layers 2 and 3 (sybil guard + bond deduplication).
@@ -313,7 +317,7 @@ pub async fn handle_peer(
     }
 
     // Detect whether the peer supports !ping/!pong heartbeat.
-    let ping_capable = peer_handshake.supports_ping();
+    let ping_capable = supported_features.supports_ping();
 
     // Create per-peer write channel for directed messages (privmsg relay,
     // peerlist, heartbeat probes).
@@ -323,7 +327,13 @@ pub async fn handle_peer(
     // minimise the window where admission has passed but the peer is not yet
     // visible to the router (heartbeat sweeps, privmsg routing, etc.).
     let shutdown_token = CancellationToken::new();
-    router.register_peer_meta(&nick, shutdown_token.clone(), probe_tx, ping_capable, is_maker);
+    router.register_peer_meta(
+        &nick,
+        shutdown_token.clone(),
+        probe_tx,
+        supported_features,
+        is_maker,
+    );
 
     // Register in the role-specific registry.  For makers, `peer_onion` is
     // always `Some` (classification guarantees this), so we can destructure
@@ -452,13 +462,11 @@ pub async fn handle_peer(
     // in PEERLIST responses (including disconnect notifications), per protocol.
     if is_maker {
         if let Some(loc) = router.locate_peer(nick.as_ref()) {
-            let disconnect_entry = format!("{};{};D", nick, loc);
-            let mut body = disconnect_entry;
+            let mut entries = vec![format!("{};{};D", nick, loc)];
             if let Some((dn_nick, dn_loc)) = router.dn_identity_pair() {
-                body.push(',');
-                body.push_str(&format!("{};{}", dn_nick, dn_loc));
+                entries.push(format!("{};{}", dn_nick, dn_loc));
             }
-            let env = OnionEnvelope::new(msg_type::PEERLIST, body);
+            let env = OnionEnvelope::new(msg_type::PEERLIST, entries.join(","));
             router.broadcast_raw(Arc::from(env.serialize().as_str()));
         }
     }
@@ -468,6 +476,29 @@ pub async fn handle_peer(
     admission.release_peer(nick.as_ref(), is_maker);
 
     tracing::info!(nick = %nick, "Peer disconnected and deregistered");
+}
+
+fn directory_peerlist_features() -> Arc<[Arc<str>]> {
+    vec![Arc::<str>::from("peerlist_features"), Arc::<str>::from("ping")].into()
+}
+
+fn serialize_peerlist_entry(
+    nick: &str,
+    location: &str,
+    advertised_features: &[Arc<str>],
+    include_features: bool,
+) -> String {
+    let mut entry = format!("{};{}", nick, location);
+    if include_features && !advertised_features.is_empty() {
+        let suffix = advertised_features
+            .iter()
+            .map(|feature| feature.as_ref())
+            .collect::<Vec<_>>()
+            .join("+");
+        entry.push_str(";F:");
+        entry.push_str(&suffix);
+    }
+    entry
 }
 
 /// Send the directory's type=795 handshake response.
@@ -488,7 +519,7 @@ async fn send_dn_handshake(
         location_string: format!("{}:{}", dir_onion, crate::VIRTUAL_PORT),
         proto_ver_min: CURRENT_PROTO_VER,
         proto_ver_max: CURRENT_PROTO_VER,
-        features: HashMap::new(),
+        features: dn_supported_features(),
         accepted,
         nick: dir_nick.to_string(),
         network: network.to_string(),
@@ -624,13 +655,27 @@ async fn handle_message(
             rate_limits.getpeerlist_timestamps.push_back(now);
 
             let response = router.get_peers_response();
+            let include_features = router.peer_supports_peerlist_features(nick.as_ref());
             let mut entries: Vec<String> = Vec::with_capacity(response.peers.len() + 1);
             // Include DN itself (Python DN always includes itself in the peerlist)
             if let Some((dn_nick, dn_loc)) = router.dn_identity_pair() {
-                entries.push(format!("{};{}", dn_nick, dn_loc));
+                let dn_features = directory_peerlist_features();
+                entries.push(serialize_peerlist_entry(
+                    dn_nick.as_ref(),
+                    dn_loc.as_ref(),
+                    dn_features.as_ref(),
+                    include_features,
+                ));
             }
             for maker in &response.peers {
-                entries.push(format!("{};{}", maker.nick, maker.onion_address.as_location_string()));
+                let advertised_features = router.peer_advertised_features(maker.nick.as_ref())
+                    .unwrap_or_else(|| Arc::<[Arc<str>]>::from([]));
+                entries.push(serialize_peerlist_entry(
+                    maker.nick.as_ref(),
+                    maker.onion_address.as_location_string().as_str(),
+                    advertised_features.as_ref(),
+                    include_features,
+                ));
             }
             let peerlist_body = entries.join(",");
             let env = OnionEnvelope::new(msg_type::PEERLIST, peerlist_body);
@@ -724,11 +769,25 @@ async fn dispatch_privmsg(
     // 2. Send a peerlist (type=789) with the sender's location to the target,
     //    so they can connect directly. Include the DN itself.
     if let Some(ref onion) = from_onion {
+        let include_features = router.peer_supports_peerlist_features(to_nick);
+        let sender_features = router.peer_advertised_features(from_nick.as_ref())
+            .unwrap_or_else(|| Arc::<[Arc<str>]>::from([]));
         let mut entries = vec![
-            format!("{};{}", from_nick, onion.as_location_string()),
+            serialize_peerlist_entry(
+                from_nick.as_ref(),
+                onion.as_location_string().as_str(),
+                sender_features.as_ref(),
+                include_features,
+            ),
         ];
         if let Some((dn_nick, dn_loc)) = router.dn_identity_pair() {
-            entries.push(format!("{};{}", dn_nick, dn_loc));
+            let dn_features = directory_peerlist_features();
+            entries.push(serialize_peerlist_entry(
+                dn_nick.as_ref(),
+                dn_loc.as_ref(),
+                dn_features.as_ref(),
+                include_features,
+            ));
         }
         let peerlist_env = OnionEnvelope::new(msg_type::PEERLIST, entries.join(","));
         let peerlist_bytes: Arc<str> = Arc::from(peerlist_env.serialize().as_str());
@@ -741,4 +800,39 @@ async fn dispatch_privmsg(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_serialize_peerlist_entry_legacy_omits_features() {
+        let features: Arc<[Arc<str>]> = vec![Arc::<str>::from("ping")].into();
+        assert_eq!(
+            serialize_peerlist_entry("J5nickOOOOOOOOOO", "abc.onion:5222", features.as_ref(), false),
+            "J5nickOOOOOOOOOO;abc.onion:5222"
+        );
+    }
+
+    #[test]
+    fn test_serialize_peerlist_entry_extended_preserves_sorted_features() {
+        let features: Arc<[Arc<str>]> = vec![
+            Arc::<str>::from("peerlist_features"),
+            Arc::<str>::from("ping"),
+            Arc::<str>::from("weird"),
+        ].into();
+        assert_eq!(
+            serialize_peerlist_entry("J5nickOOOOOOOOOO", "abc.onion:5222", features.as_ref(), true),
+            "J5nickOOOOOOOOOO;abc.onion:5222;F:peerlist_features+ping+weird"
+        );
+    }
+
+    #[test]
+    fn test_directory_peerlist_features_are_static() {
+        assert_eq!(
+            directory_peerlist_features().iter().map(|f| f.as_ref()).collect::<Vec<_>>(),
+            vec!["peerlist_features", "ping"]
+        );
+    }
 }

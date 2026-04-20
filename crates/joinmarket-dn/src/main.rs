@@ -1,12 +1,11 @@
-use clap::{CommandFactory, FromArgMatches, Parser};
 use std::path::PathBuf;
 use std::sync::Arc;
+
+use clap::{Command, CommandFactory, FromArgMatches, Parser};
 use tokio_util::sync::CancellationToken;
 
-use joinmarket_dn::{router, admission, heartbeat, server, metrics};
+use joinmarket_dn::{admission, heartbeat, metrics, router, server, DN_VERSION, VIRTUAL_PORT};
 use joinmarket_tor::TorBackendConfig;
-
-use joinmarket_dn::VIRTUAL_PORT;
 
 #[derive(Parser, Debug)]
 #[command(name = "joinmarket-dn")]
@@ -29,11 +28,15 @@ pub struct Args {
     pub operator_message: Option<String>,
 }
 
+fn build_command() -> Command {
+    Args::command()
+        .version(DN_VERSION)
+        .about(format!("JoinMarket Directory Node (Rust) [{}]", joinmarket_tor::BACKEND_NAME))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let matches = Args::command()
-        .about(format!("JoinMarket Directory Node (Rust) [{}]", joinmarket_tor::BACKEND_NAME))
-        .get_matches();
+    let matches = build_command().get_matches();
     let args = Args::from_arg_matches(&matches)?;
 
     // Resolve data directory
@@ -115,7 +118,11 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(feature = "arti")]
     let onion_serving_port: u16 = VIRTUAL_PORT;
 
-    tracing::info!("JoinMarket Directory Node starting");
+    tracing::info!(
+        version = DN_VERSION,
+        backend = joinmarket_tor::BACKEND_NAME,
+        "JoinMarket Directory Node starting"
+    );
     tracing::info!("Network: {}, Port: {}", network, onion_serving_port);
 
     // Bootstrap Tor backend
@@ -222,12 +229,27 @@ fn expand_tilde(s: &str) -> String {
 /// only to the joinmarket workspace crates.
 fn map_log_level(level: &str) -> String {
     let crate_level = match level.to_uppercase().as_str() {
-        "DEBUG"   => "debug",
-        "INFO"    => "info",
+        "DEBUG" => "debug",
+        "INFO" => "info",
         "WARNING" => "warn",
-        "ERROR"   => "error",
-        _         => "info",   // safe default for unrecognised values
+        "ERROR" => "error",
+        _ => "info", // safe default for unrecognised values
     };
     // Global default: error for all crates; joinmarket crates use config level
     format!("error,joinmarket_dn={crate_level},joinmarket_core={crate_level},joinmarket_tor={crate_level}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_command, DN_VERSION};
+
+    #[test]
+    fn version_flag_displays_binary_version() {
+        let err = build_command()
+            .try_get_matches_from(["joinmarket-dn", "--version"])
+            .unwrap_err();
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert!(err.to_string().contains(DN_VERSION));
+    }
 }

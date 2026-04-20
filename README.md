@@ -101,7 +101,7 @@ Features are defined on the `joinmarket-tor` crate and are passed through to the
 | Feature | Crate | What it enables | Default |
 |---------|-------|-----------------|---------|
 | `tordaemon` | `joinmarket-tor` | C Tor daemon backend (`CTorProvider`). Requires the `tor` binary on the host. PoW defence is configured externally via C Tor (requires a `tor` build with `--enable-gpl`); the directory node has no visibility into whether PoW is active. | **On** |
-| `arti` | `joinmarket-tor` | Arti embedded Tor backend (`ArtiTorProvider`). No external `tor` binary needed. Pulls in LGPL `equix`/`hashx` crates for PoW; activated at runtime with `--pow`. | Off |
+| `arti` | `joinmarket-tor` | Arti embedded Tor backend (`ArtiTorProvider`). No external `tor` binary needed. Pulls in LGPL `equix`/`hashx` crates for PoW; activated at runtime with `--pow`. **Security note:** current upstream Arti transitive dependencies still carry unresolved advisories (`rsa` Marvin Attack, unmaintained `bincode`, unmaintained `paste`), so prefer the default `tordaemon` backend for production deployments. | Off |
 
 **Default build (C Tor daemon backend):**
 
@@ -110,6 +110,8 @@ cargo build --release
 ```
 
 The `tordaemon` feature is on by default. Configure your existing C Tor hidden service directory in `joinmarket.cfg` and run the binary.
+
+> **Production recommendation:** prefer the default `tordaemon` backend until the remaining upstream Arti-only advisories are fixed.
 
 **Build with the Arti embedded backend:**
 
@@ -234,6 +236,11 @@ Designed for **100k concurrent peers** on a single server:
 | PeerMeta in DashMap | ~128 B | ~13 MB |
 | Nick index entry | ~200 B | ~20 MB |
 | **Total** | **~14 KB** | **~1.4 GB** |
+
+## Metrics exposure
+
+Keep `--metrics-bind` on loopback unless you are intentionally publishing metrics through a protected channel.
+If remote scraping is required, place the Prometheus endpoint behind a firewall, reverse proxy, or SSH tunnel.
 
 ## systemd service
 

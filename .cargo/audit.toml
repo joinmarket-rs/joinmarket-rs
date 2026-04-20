@@ -7,10 +7,12 @@
 # The default `tordaemon` build is unaffected.
 # cargo-deny runs with default features and therefore does not see these
 # advisories; cargo audit scans the full Cargo.lock and does, so we suppress
-# them here only.
+# them here only while upstream Arti remediation is pending.
 ignore = [
     # RUSTSEC-2023-0071 — Marvin Attack in `rsa` crate.
-    # No fixed version available upstream.
+    # Remaining arti-only advisory with no fixed version available upstream.
+    # Until Arti removes or replaces this dependency, prefer the default
+    # `tordaemon` backend for production deployments.
     "RUSTSEC-2023-0071",
     # RUSTSEC-2025-0141 — bincode 2.x is unmaintained.
     # Transitive arti dep (tor-netdir → typed-index-collections → bincode).

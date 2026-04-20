@@ -15,23 +15,23 @@ data-encoding = "2"
 sha3 = "0.10"
 
 [dependencies.arti-client]
-version = "0.40"
+version = "0.41"
 default-features = false
 features = ["onion-service-service", "hs-pow-full", "tokio", "rustls", "compression"]
 optional = true
 
 [dependencies.tor-hsservice]
-version = "0.40"
+version = "0.41"
 optional = true
 
 [dependencies.tor-rtcompat]
-version = "0.40"
+version = "0.41"
 default-features = false
 features = ["tokio", "rustls"]
 optional = true
 
 [dependencies.tor-cell]
-version = "0.40"
+version = "0.41"
 optional = true
 
 [dependencies.safelog]

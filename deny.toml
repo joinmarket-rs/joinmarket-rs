@@ -11,19 +11,7 @@
 # Suppress arti-feature-only advisories.  These affect *only* the
 # `--features arti` build; the default `tordaemon` build is unaffected.
 # Each entry documents the reason the suppression is safe.
-ignore = [
-    # RUSTSEC-2025-0141 — bincode 2.x is unmaintained.
-    # Transitive dep of tor-netdir (typed-index-collections → bincode).
-    # No fix available upstream; bincode does not affect the security boundary
-    # of the DN (it is used internally by Arti for directory data structures,
-    # not for any peer-supplied input).  Monitor arti-client releases for removal.
-    "RUSTSEC-2025-0141",
-    # RUSTSEC-2024-0436 — paste 1.x is unmaintained.
-    # Transitive dep of tor-rtcompat and many other Arti crates.
-    # paste is a proc-macro used at compile time only; it has no runtime
-    # attack surface.  Monitor arti-client releases for removal.
-    "RUSTSEC-2024-0436",
-]
+ignore = []
 
 # ── License policy ────────────────────────────────────────────────────────────
 
@@ -36,19 +24,17 @@ allow = [
     "BSD-1-Clause",
     "BSD-2-Clause",
     "BSD-3-Clause",
-    "ISC",
     "Unicode-3.0",
     "Unlicense",
     "CC0-1.0",
-    "Zlib",
 ]
 
 # ── Crate ban policy ─────────────────────────────────────────────────────────
 
 [bans]
 # Warn (not error) on duplicate crate versions — some are unavoidable due to
-# the hyper 0.14 / hyper 1.x split in metrics-exporter-prometheus 0.13.
-# See finding #17 in SECURITY_REMEDIATION_PLAN.md for the upgrade path.
+# the hashbrown split between dashmap/metrics-util and indexmap/h2.
+# Review duplicates periodically as transitive dependencies evolve.
 multiple-versions = "warn"
 # Wildcard version specs are banned; they make auditing impossible.
 # Path-only workspace-internal deps have no version field and are flagged as

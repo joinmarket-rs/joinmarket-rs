@@ -204,6 +204,27 @@ async fn test_handshake_taker_registers() {
 }
 
 #[tokio::test]
+async fn test_invalid_feature_name_rejected_during_handshake() {
+    let (tor, router, shutdown) = start_test_server().await;
+
+    let (mut reader, mut writer) = connect_to_server(&tor).await;
+    let envelope = wrap_in_handshake_envelope(&peer_handshake_json_with_features(
+        NICK_TAKER,
+        "",
+        r#"{"bad-feature":true}"#,
+    ));
+    writer.write_all(envelope.as_bytes()).await.unwrap();
+    writer.flush().await.unwrap();
+
+    assert!(read_envelope(&mut reader).await.is_none(), "invalid feature handshake should be silently dropped");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(router.maker_count(), 0);
+    assert_eq!(router.taker_count(), 0);
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
 async fn test_dn_handshake_advertises_ping_and_peerlist_features() {
     let (tor, _router, shutdown) = start_test_server().await;
 

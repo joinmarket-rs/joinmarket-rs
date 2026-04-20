@@ -56,8 +56,15 @@ pub struct TakerInfo {
     pub onion_address: Option<OnionServiceAddr>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PeerlistEntry {
+    pub nick: Arc<str>,
+    pub onion_address: OnionServiceAddr,
+    pub advertised_features: Arc<[Arc<str>]>,
+}
+
 pub struct PeersResponse {
-    pub peers: Vec<MakerInfo>,
+    pub peers: Vec<PeerlistEntry>,
     pub total_makers: usize,
     pub returned: usize,
     pub sampling: Option<&'static str>,
@@ -413,9 +420,13 @@ impl Router {
         if total_makers <= MAX_MAKERS_BEFORE_SAMPLE {
             let all_makers = self.makers.all_values();
             let returned = all_makers.len();
+            let peers = all_makers
+                .into_iter()
+                .map(|maker| self.maker_to_peerlist_entry(maker))
+                .collect();
             PeersResponse {
                 returned,
-                peers: all_makers,
+                peers,
                 total_makers: returned,
                 sampling: None,
                 request_more: false,
@@ -425,8 +436,12 @@ impl Router {
             // cloning the entire registry into a temporary Vec first.
             let (sample, actual_total) = self.makers.sample_values(SAMPLE_TARGET);
             let returned = sample.len();
+            let peers = sample
+                .into_iter()
+                .map(|maker| self.maker_to_peerlist_entry(maker))
+                .collect();
             PeersResponse {
-                peers: sample,
+                peers,
                 total_makers: actual_total,
                 returned,
                 sampling: Some("random"),
@@ -455,6 +470,16 @@ impl Router {
     pub fn peer_advertised_features(&self, nick: &str) -> Option<Arc<[Arc<str>]>> {
         self.peer_meta.get(nick)
             .map(|meta| meta.supported_features.advertised())
+    }
+
+    fn maker_to_peerlist_entry(&self, maker: MakerInfo) -> PeerlistEntry {
+        let advertised_features = self.peer_advertised_features(maker.nick.as_ref())
+            .unwrap_or_default();
+        PeerlistEntry {
+            nick: maker.nick,
+            onion_address: maker.onion_address,
+            advertised_features,
+        }
     }
 
     /// Broadcast to all connected peers (makers and takers).

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 pub const CURRENT_PROTO_VER: u8 = 5;
+pub const DN_SUPPORTED_FEATURE_NAMES: &[&str] = &["peerlist_features", "ping"];
 
 // ── Onion channel handshake types (wire-compatible with Python JoinMarket) ───
 
@@ -40,6 +41,11 @@ const MAX_FEATURE_KEY_LEN: usize = 64;
 /// The largest legitimate value is `fidelity_bond` (~336 bytes base64 of 252).
 const MAX_FEATURE_VALUE_LEN: usize = 512;
 
+fn is_valid_feature_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_'))
+}
+
 impl PeerHandshake {
     pub fn parse_json(json: &str) -> Result<Self, HandshakeError> {
         let msg: PeerHandshake = serde_json::from_str(json)?;
@@ -55,10 +61,14 @@ impl PeerHandshake {
         if msg.features.len() > MAX_FEATURES_ENTRIES {
             return Err(HandshakeError::TooManyFeatures(msg.features.len()));
         }
-        // Reject oversized feature keys, oversized string values, and nested structures.
+        // Reject oversized feature keys, invalid feature names, oversized string
+        // values, and nested structures.
         for (key, value) in &msg.features {
             if key.len() > MAX_FEATURE_KEY_LEN {
                 return Err(HandshakeError::FieldTooLong);
+            }
+            if !is_valid_feature_name(key) {
+                return Err(HandshakeError::InvalidFeatureName(key.clone()));
             }
             if value.as_str().is_some_and(|s| s.len() > MAX_FEATURE_VALUE_LEN) {
                 return Err(HandshakeError::FieldTooLong);
@@ -83,33 +93,13 @@ impl PeerHandshake {
     }
 
     /// Returns the names of all features explicitly advertised as JSON boolean
-    /// `true`, sorted alphabetically for deterministic output.
+    /// `true`. Ordering is preserved from the underlying map iteration; callers
+    /// that need deterministic output must sort the result themselves.
     pub fn advertised_true_features(&self) -> Vec<String> {
-        let mut features: Vec<String> = self.features
+        self.features
             .iter()
             .filter_map(|(name, value)| value.as_bool().filter(|b| *b).map(|_| name.clone()))
-            .collect();
-        features.sort_unstable();
-        features
-    }
-
-    /// Returns true if the peer advertised `!ping`/`!pong` heartbeat support via
-    /// `"features": {"ping": true}` in their handshake. Python clients never set
-    /// this, so it defaults to false.
-    pub fn supports_ping(&self) -> bool {
-        self.features
-            .get("ping")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-    }
-
-    /// Returns true if the peer advertised support for extended PEERLIST entries
-    /// via `"features": {"peerlist_features": true}` in their handshake.
-    pub fn supports_peerlist_features(&self) -> bool {
-        self.features
-            .get("peerlist_features")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
+            .collect()
     }
 
     /// Validate handshake fields. Returns the parsed `OnionServiceAddr` if the
@@ -172,11 +162,15 @@ impl DnHandshake {
     }
 }
 
+pub fn dn_supported_feature_names() -> &'static [&'static str] {
+    DN_SUPPORTED_FEATURE_NAMES
+}
+
 pub fn dn_supported_features() -> HashMap<String, serde_json::Value> {
-    HashMap::from([
-        ("peerlist_features".to_string(), serde_json::Value::Bool(true)),
-        ("ping".to_string(), serde_json::Value::Bool(true)),
-    ])
+    dn_supported_feature_names()
+        .iter()
+        .map(|name| ((*name).to_string(), serde_json::Value::Bool(true)))
+        .collect()
 }
 
 
@@ -194,6 +188,8 @@ pub enum HandshakeError {
     MalformedNick,
     #[error("too many features entries: {0} (max {})", MAX_FEATURES_ENTRIES)]
     TooManyFeatures(usize),
+    #[error("invalid feature name '{0}' (expected [a-z0-9_]+)")]
+    InvalidFeatureName(String),
     #[error("nested value not allowed in features key '{0}'")]
     NestedFeatureValue(String),
     #[error("handshake field or feature value exceeds maximum allowed length")]
@@ -343,13 +339,12 @@ mod tests {
     }
 
     #[test]
-    fn test_advertised_true_features_preserves_unknown_and_sorts() {
+    fn test_advertised_true_features_preserves_unknown_features() {
         let json = r#"{"app-name":"joinmarket","directory":false,"location-string":"","proto-ver":5,"features":{"zeta":true,"ping":true,"alpha":true},"nick":"J5xhGSWE7VrxM7sO","network":"mainnet"}"#;
         let msg = PeerHandshake::parse_json(json).unwrap();
-        assert_eq!(
-            msg.advertised_true_features(),
-            vec!["alpha".to_string(), "ping".to_string(), "zeta".to_string()]
-        );
+        let mut features = msg.advertised_true_features();
+        features.sort_unstable();
+        assert_eq!(features, vec!["alpha".to_string(), "ping".to_string(), "zeta".to_string()]);
     }
 
     #[test]
@@ -360,15 +355,26 @@ mod tests {
     }
 
     #[test]
-    fn test_supports_peerlist_features() {
-        let json = r#"{"app-name":"joinmarket","directory":false,"location-string":"","proto-ver":5,"features":{"peerlist_features":true},"nick":"J5xhGSWE7VrxM7sO","network":"mainnet"}"#;
-        let msg = PeerHandshake::parse_json(json).unwrap();
-        assert!(msg.supports_peerlist_features());
-        assert!(!msg.supports_ping());
+    fn test_invalid_feature_name_rejected() {
+        let json = r#"{"app-name":"joinmarket","directory":false,"location-string":"","proto-ver":5,"features":{"evil;D":true},"nick":"J5xhGSWE7VrxM7sO","network":"mainnet"}"#;
+        let err = PeerHandshake::parse_json(json).unwrap_err();
+        assert!(matches!(err, HandshakeError::InvalidFeatureName(name) if name == "evil;D"));
+    }
+
+    #[test]
+    fn test_invalid_feature_name_variants_rejected() {
+        for invalid in ["x,y", "ping+weird", "has space", "UpperCase", "hyphen-name", "", "pé"] {
+            let json = format!(
+                "{{\"app-name\":\"joinmarket\",\"directory\":false,\"location-string\":\"\",\"proto-ver\":5,\"features\":{{\"{invalid}\":true}},\"nick\":\"J5xhGSWE7VrxM7sO\",\"network\":\"mainnet\"}}"
+            );
+            let err = PeerHandshake::parse_json(&json).unwrap_err();
+            assert!(matches!(err, HandshakeError::InvalidFeatureName(name) if name == invalid));
+        }
     }
 
     #[test]
     fn test_dn_supported_features() {
+        assert_eq!(dn_supported_feature_names(), &["peerlist_features", "ping"]);
         let features = dn_supported_features();
         assert_eq!(features.get("ping"), Some(&serde_json::Value::Bool(true)));
         assert_eq!(

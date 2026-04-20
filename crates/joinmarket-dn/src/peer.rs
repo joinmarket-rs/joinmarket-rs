@@ -3,8 +3,11 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
+use std::sync::LazyLock;
+
 use joinmarket_core::handshake::{
-    DnHandshake, HandshakeError, PeerHandshake, CURRENT_PROTO_VER, dn_supported_features,
+    DnHandshake, HandshakeError, PeerHandshake, CURRENT_PROTO_VER, dn_supported_feature_names,
+    dn_supported_features,
 };
 use joinmarket_core::message::{
     OnionEnvelope, msg_type,
@@ -273,7 +276,9 @@ pub async fn handle_peer(
                     // Silent disconnect — field too long is a protocol violation.
                     metrics::counter!("jm_handshakes_total", "result" => "field_too_long").increment(1);
                 }
-                HandshakeError::TooManyFeatures(_) | HandshakeError::NestedFeatureValue(_) => {
+                HandshakeError::TooManyFeatures(_)
+                | HandshakeError::InvalidFeatureName(_)
+                | HandshakeError::NestedFeatureValue(_) => {
                     // Silent disconnect.
                     metrics::counter!("jm_handshakes_total", "result" => "malformed_features").increment(1);
                 }
@@ -462,11 +467,14 @@ pub async fn handle_peer(
     // in PEERLIST responses (including disconnect notifications), per protocol.
     if is_maker {
         if let Some(loc) = router.locate_peer(nick.as_ref()) {
-            let mut entries = vec![format!("{};{};D", nick, loc)];
+            let mut body = format!("{};{};D", nick, loc);
             if let Some((dn_nick, dn_loc)) = router.dn_identity_pair() {
-                entries.push(format!("{};{}", dn_nick, dn_loc));
+                body.push(',');
+                body.push_str(dn_nick.as_ref());
+                body.push(';');
+                body.push_str(dn_loc.as_ref());
             }
-            let env = OnionEnvelope::new(msg_type::PEERLIST, entries.join(","));
+            let env = OnionEnvelope::new(msg_type::PEERLIST, body);
             router.broadcast_raw(Arc::from(env.serialize().as_str()));
         }
     }
@@ -478,27 +486,46 @@ pub async fn handle_peer(
     tracing::info!(nick = %nick, "Peer disconnected and deregistered");
 }
 
-fn directory_peerlist_features() -> Arc<[Arc<str>]> {
-    vec![Arc::<str>::from("peerlist_features"), Arc::<str>::from("ping")].into()
+static DIRECTORY_PEERLIST_FEATURES: LazyLock<Arc<[Arc<str>]>> = LazyLock::new(|| {
+    dn_supported_feature_names()
+        .iter()
+        .map(|feature| Arc::<str>::from(*feature))
+        .collect::<Vec<_>>()
+        .into()
+});
+
+static EMPTY_ADVERTISED_FEATURES: LazyLock<Arc<[Arc<str>]>> = LazyLock::new(|| Vec::<Arc<str>>::new().into());
+
+fn directory_peerlist_features() -> &'static Arc<[Arc<str>]> {
+    &DIRECTORY_PEERLIST_FEATURES
 }
 
-fn serialize_peerlist_entry(
+fn empty_advertised_features() -> &'static Arc<[Arc<str>]> {
+    &EMPTY_ADVERTISED_FEATURES
+}
+
+fn append_peerlist_entry(
+    body: &mut String,
     nick: &str,
     location: &str,
     advertised_features: &[Arc<str>],
     include_features: bool,
-) -> String {
-    let mut entry = format!("{};{}", nick, location);
-    if include_features && !advertised_features.is_empty() {
-        let suffix = advertised_features
-            .iter()
-            .map(|feature| feature.as_ref())
-            .collect::<Vec<_>>()
-            .join("+");
-        entry.push_str(";F:");
-        entry.push_str(&suffix);
+) {
+    if !body.is_empty() {
+        body.push(',');
     }
-    entry
+    body.push_str(nick);
+    body.push(';');
+    body.push_str(location);
+    if include_features && !advertised_features.is_empty() {
+        body.push_str(";F:");
+        for (idx, feature) in advertised_features.iter().enumerate() {
+            if idx > 0 {
+                body.push('+');
+            }
+            body.push_str(feature.as_ref());
+        }
+    }
 }
 
 /// Send the directory's type=795 handshake response.
@@ -656,28 +683,27 @@ async fn handle_message(
 
             let response = router.get_peers_response();
             let include_features = router.peer_supports_peerlist_features(nick.as_ref());
-            let mut entries: Vec<String> = Vec::with_capacity(response.peers.len() + 1);
+            let mut peerlist_body = String::new();
             // Include DN itself (Python DN always includes itself in the peerlist)
             if let Some((dn_nick, dn_loc)) = router.dn_identity_pair() {
-                let dn_features = directory_peerlist_features();
-                entries.push(serialize_peerlist_entry(
+                append_peerlist_entry(
+                    &mut peerlist_body,
                     dn_nick.as_ref(),
                     dn_loc.as_ref(),
-                    dn_features.as_ref(),
+                    directory_peerlist_features().as_ref(),
                     include_features,
-                ));
+                );
             }
             for maker in &response.peers {
-                let advertised_features = router.peer_advertised_features(maker.nick.as_ref())
-                    .unwrap_or_else(|| Arc::<[Arc<str>]>::from([]));
-                entries.push(serialize_peerlist_entry(
+                let location = maker.onion_address.as_location_string();
+                append_peerlist_entry(
+                    &mut peerlist_body,
                     maker.nick.as_ref(),
-                    maker.onion_address.as_location_string().as_str(),
-                    advertised_features.as_ref(),
+                    location.as_str(),
+                    maker.advertised_features.as_ref(),
                     include_features,
-                ));
+                );
             }
-            let peerlist_body = entries.join(",");
             let env = OnionEnvelope::new(msg_type::PEERLIST, peerlist_body);
             send_envelope(writer, nick.as_ref(), &env).await?;
         }
@@ -771,25 +797,26 @@ async fn dispatch_privmsg(
     if let Some(ref onion) = from_onion {
         let include_features = router.peer_supports_peerlist_features(to_nick);
         let sender_features = router.peer_advertised_features(from_nick.as_ref())
-            .unwrap_or_else(|| Arc::<[Arc<str>]>::from([]));
-        let mut entries = vec![
-            serialize_peerlist_entry(
-                from_nick.as_ref(),
-                onion.as_location_string().as_str(),
-                sender_features.as_ref(),
-                include_features,
-            ),
-        ];
+            .unwrap_or_else(|| empty_advertised_features().clone());
+        let mut peerlist_body = String::new();
+        let sender_location = onion.as_location_string();
+        append_peerlist_entry(
+            &mut peerlist_body,
+            from_nick.as_ref(),
+            sender_location.as_str(),
+            sender_features.as_ref(),
+            include_features,
+        );
         if let Some((dn_nick, dn_loc)) = router.dn_identity_pair() {
-            let dn_features = directory_peerlist_features();
-            entries.push(serialize_peerlist_entry(
+            append_peerlist_entry(
+                &mut peerlist_body,
                 dn_nick.as_ref(),
                 dn_loc.as_ref(),
-                dn_features.as_ref(),
+                directory_peerlist_features().as_ref(),
                 include_features,
-            ));
+            );
         }
-        let peerlist_env = OnionEnvelope::new(msg_type::PEERLIST, entries.join(","));
+        let peerlist_env = OnionEnvelope::new(msg_type::PEERLIST, peerlist_body);
         let peerlist_bytes: Arc<str> = Arc::from(peerlist_env.serialize().as_str());
         if let SendResult::ChannelFull = router.send_to_peer(to_nick, peerlist_bytes) {
             tracing::warn!(
@@ -807,25 +834,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_serialize_peerlist_entry_legacy_omits_features() {
+    fn test_append_peerlist_entry_legacy_omits_features() {
         let features: Arc<[Arc<str>]> = vec![Arc::<str>::from("ping")].into();
-        assert_eq!(
-            serialize_peerlist_entry("J5nickOOOOOOOOOO", "abc.onion:5222", features.as_ref(), false),
-            "J5nickOOOOOOOOOO;abc.onion:5222"
-        );
+        let mut body = String::new();
+        append_peerlist_entry(&mut body, "J5nickOOOOOOOOOO", "abc.onion:5222", features.as_ref(), false);
+        assert_eq!(body, "J5nickOOOOOOOOOO;abc.onion:5222");
     }
 
     #[test]
-    fn test_serialize_peerlist_entry_extended_preserves_sorted_features() {
+    fn test_append_peerlist_entry_extended_preserves_sorted_features() {
         let features: Arc<[Arc<str>]> = vec![
             Arc::<str>::from("peerlist_features"),
             Arc::<str>::from("ping"),
             Arc::<str>::from("weird"),
         ].into();
-        assert_eq!(
-            serialize_peerlist_entry("J5nickOOOOOOOOOO", "abc.onion:5222", features.as_ref(), true),
-            "J5nickOOOOOOOOOO;abc.onion:5222;F:peerlist_features+ping+weird"
-        );
+        let mut body = String::new();
+        append_peerlist_entry(&mut body, "J5nickOOOOOOOOOO", "abc.onion:5222", features.as_ref(), true);
+        assert_eq!(body, "J5nickOOOOOOOOOO;abc.onion:5222;F:peerlist_features+ping+weird");
     }
 
     #[test]
@@ -834,5 +859,13 @@ mod tests {
             directory_peerlist_features().iter().map(|f| f.as_ref()).collect::<Vec<_>>(),
             vec!["peerlist_features", "ping"]
         );
+    }
+
+    #[test]
+    fn test_append_peerlist_entry_adds_commas_between_entries() {
+        let mut body = String::new();
+        append_peerlist_entry(&mut body, "J5nickOOOOOOOOOO", "abc.onion:5222", &[], false);
+        append_peerlist_entry(&mut body, "J5dirNickOOOOOOO", "dir.onion:5222", &[], false);
+        assert_eq!(body, "J5nickOOOOOOOOOO;abc.onion:5222,J5dirNickOOOOOOO;dir.onion:5222");
     }
 }

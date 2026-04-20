@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  default-build-test:
+    name: Default build, clippy, and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo clippy (default features)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Cargo test (default features)
+        run: cargo test --workspace
+
+  arti-check:
+    name: Arti feature compile check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo check (arti)
+        run: cargo check --workspace --no-default-features --features joinmarket-dn/arti
+
+  security-audit:
+    name: cargo-audit and cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: cargo deny
+        run: cargo deny check advisories bans licenses sources
+
+      - name: cargo audit
+        run: cargo audit
